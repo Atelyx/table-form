@@ -1,0 +1,15 @@
+# 依赖与构建产物
+
+node_modules/
+dist/
+*.tsbuildinfo
+
+# 插件运行时数据（ctx.state 落盘的表单配置；本地目录安装时写在插件目录内，属本机数据不进仓库）
+data/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
