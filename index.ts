@@ -1973,7 +1973,7 @@ export default function apply(ctx: AtelyxCtx): void {
     return h("div", { style: fieldRowStyle(false, false) }, [
       h("div", { key: "label", style: FIELD_LABEL_STYLE }, [
         h("span", { key: "n", style: { fontSize: 12, color: textSecondary, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, props.name),
-        h("span", { key: "ty", style: { fontSize: 11, color: textMuted } }, props.canRemove ? "图片 · 点击放大，悬停移除" : "图片"),
+        h("span", { key: "ty", style: { fontSize: 11, color: textMuted } }, props.canRemove ? "图片" : "图片"),
       ]),
       h("div", { key: "c", style: { flex: 1, minWidth: 0 } }, [
         h(ImagePreview, { key: "img", entries: props.entries, hasRow: props.hasRow, canRemove: props.canRemove, onRemove: props.onRemove }),
