@@ -10,7 +10,8 @@
  *   （updateCell 写回过滤后的 images 数组，display 展示偏好保留）。
  *
  * 入口自包含（无运行时 import；`import type` 为类型注解，转译时擦除）；JSX 经转译引用
- * React.createElement（宿主提供 React 全局）；样式只用 inline style + CSS 变量（Tailwind 类不可依赖）。
+ * React.createElement（宿主提供 React 全局）；样式只用 inline style + CSS 变量，颜色/字阶/
+ * 动效/圆角一律取宿主主题 token（Tailwind 类不可依赖，伪类不可写，交互态经组件状态驱动）。
  */
 import type { Context } from "@atelyx/cordis";
 
@@ -71,6 +72,11 @@ interface AtelyxCtx extends Context {
 }
 
 const React = (globalThis as { React?: ReactApi }).React as ReactApi;
+
+/** createElement 简写（经函数转发，把 React 全局的读取推迟到调用时；共享样式层的基元组件在模块层定义）。 */
+function h(type: unknown, props: Record<string, unknown> | null, ...children: unknown[]): unknown {
+  return React.createElement(type, props, ...children);
+}
 
 /** 插件 id（与 package.json 的 name 一致；`ctx.state` 读写按它隔离）。 */
 const PLUGIN_ID = "com.atelyx.table-form";
@@ -192,83 +198,294 @@ function readStateForms(raw: unknown): Record<string, FormConfig> {
 }
 
 // ===== 共享样式（inline style + CSS 变量；宿主 Tailwind 类对插件无效）=====
+// 全部颜色/字号/圆角/时长取宿主主题 token：浅深两套主题与应用级「字体大小」设置自动跟随。
+// 内联样式写不了伪类（:hover/:focus），交互态一律经组件状态驱动。
 
 const borderColor = "var(--border)";
 const textMuted = "var(--text-muted)";
 const textPrimary = "var(--text-primary)";
 const textSecondary = "var(--text-secondary)";
-/** 交互动效统一时长：hover/边框/背景过渡，克制不堆砌。 */
-const TRANSITION = "120ms";
 
-const INPUT_STYLE: Record<string, string | number> = {
-  width: "100%",
-  boxSizing: "border-box",
-  padding: "6px 8px",
-  fontSize: 13,
-  lineHeight: "20px",
-  borderRadius: 6,
-  border: "1px solid " + borderColor,
-  background: "var(--bg-primary)",
-  color: textPrimary,
-  outline: "none",
-  transition: "border-color " + TRANSITION,
+type Style = Record<string, string | number>;
+
+/** 状态变化动效：统一取宿主 fast 档时长与曲线。 */
+const EASE = "var(--dur-fast) var(--ease)";
+
+/** 字阶与行高（成对取用；rem 档，随应用「字体大小」设置缩放）。 */
+const FS = { h2: "var(--fs-h2)", body: "var(--fs-body)", ui: "var(--fs-ui)", caption: "var(--fs-caption)", micro: "var(--fs-micro)" } as const;
+const LH = { h2: "var(--lh-h2)", body: "var(--lh-body)", ui: "var(--lh-ui)", caption: "var(--lh-caption)", micro: "var(--lh-micro)" } as const;
+
+/** 圆角刻度：xs 4 / sm 6 / md 10（胶囊用 9999 全圆）。 */
+const RADIUS = { xs: "var(--radius-xs)", sm: "var(--radius-sm)", md: "var(--radius-md)" } as const;
+const RADIUS_FULL = 9999;
+
+// ===== 基元规格（对齐宿主 Button / IconButton / Input / Badge / StatusPill / EmptyState）=====
+
+type ButtonVariant = "primary" | "secondary" | "ghost" | "subtle";
+type ButtonSize = "sm" | "md";
+
+const BUTTON_VARIANT: Record<ButtonVariant, { background: string; color: string; hoverBackground: string; hoverColor: string }> = {
+  primary: { background: "var(--accent)", color: "var(--accent-fg)", hoverBackground: "var(--accent-hover)", hoverColor: "var(--accent-fg)" },
+  secondary: { background: "var(--bg-tertiary)", color: "var(--text-primary)", hoverBackground: "var(--hover)", hoverColor: "var(--text-primary)" },
+  ghost: { background: "transparent", color: textSecondary, hoverBackground: "var(--hover)", hoverColor: textPrimary },
+  subtle: { background: "transparent", color: textMuted, hoverBackground: "transparent", hoverColor: textPrimary },
 };
 
-function buttonStyle(primary: boolean): Record<string, string | number> {
+/** 控件高固定（sm 24 / md 28），字号变化不撑开布局。 */
+const BUTTON_SIZE: Record<ButtonSize, Style> = {
+  sm: { height: 24, padding: "0 8px", fontSize: FS.micro, lineHeight: LH.micro, gap: 4, borderRadius: RADIUS.sm },
+  md: { height: 28, padding: "0 12px", fontSize: FS.ui, lineHeight: LH.ui, gap: 6, borderRadius: RADIUS.sm },
+};
+
+function buttonStyle(variant: ButtonVariant, size: ButtonSize, hovered: boolean): Style {
+  const v = BUTTON_VARIANT[variant];
   return {
     display: "inline-flex",
     alignItems: "center",
-    gap: 4,
-    padding: "5px 12px",
-    fontSize: 12,
-    borderRadius: 6,
+    justifyContent: "center",
+    flexShrink: 0,
+    fontWeight: 500,
+    whiteSpace: "nowrap",
     cursor: "pointer",
-    border: "1px solid " + (primary ? "var(--accent)" : borderColor),
-    background: primary ? "var(--accent)" : "var(--bg-secondary)",
-    color: primary ? "var(--accent-fg)" : textSecondary,
-    transition: "background " + TRANSITION + ", border-color " + TRANSITION + ", color " + TRANSITION,
+    border: "none",
+    outline: "none",
+    ...BUTTON_SIZE[size],
+    background: hovered ? v.hoverBackground : v.background,
+    color: hovered ? v.hoverColor : v.color,
+    transition: "background " + EASE + ", color " + EASE + ", box-shadow " + EASE,
   };
 }
 
-/** 单选选项的胶囊按钮样式（选中 = accent 描边 + 浅 accent 底）。 */
-function chipStyle(selected: boolean): Record<string, string | number> {
+/** 文字按钮（自带 hover 态；disabled 收敛为统一弱化）。 */
+function Button(props: {
+  variant?: ButtonVariant;
+  size?: ButtonSize;
+  disabled?: boolean;
+  title?: string;
+  style?: Style;
+  onClick?: (e: unknown) => void;
+  children?: unknown;
+}) {
+  const [hovered, setHovered] = React.useState(false);
+  const [ring, ringProps] = useFocusRing();
+  const variant = props.variant || "secondary";
+  return h(
+    "button",
+    {
+      type: "button",
+      disabled: props.disabled,
+      title: props.title,
+      onClick: props.onClick,
+      onMouseEnter: () => setHovered(true),
+      onMouseLeave: () => setHovered(false),
+      ...ringProps,
+      style: {
+        ...buttonStyle(variant, props.size || "sm", hovered && !props.disabled),
+        boxShadow: ring ? "var(--focus-ring)" : "none",
+        ...(props.disabled ? { opacity: 0.4, cursor: "not-allowed" } : null),
+        ...props.style,
+      },
+    },
+    props.children,
+  );
+}
+
+/** 正方形图标按钮档（xs 20 / sm 24）。 */
+const ICON_BUTTON_SIZE: Record<"xs" | "sm", Style> = {
+  xs: { width: 20, height: 20, borderRadius: RADIUS.xs },
+  sm: { width: 24, height: 24, borderRadius: RADIUS.sm },
+};
+
+/** 图标按钮（自带 hover 态；`label` 同时作无障碍名与悬停提示）。 */
+function IconButton(props: {
+  variant?: ButtonVariant;
+  size?: "xs" | "sm";
+  label: string;
+  icon: unknown;
+  disabled?: boolean;
+  style?: Style;
+  onClick?: (e: unknown) => void;
+}) {
+  const [hovered, setHovered] = React.useState(false);
+  const [ring, ringProps] = useFocusRing();
+  const variant = props.variant || "subtle";
+  return h(
+    "button",
+    {
+      type: "button",
+      "aria-label": props.label,
+      title: props.label,
+      disabled: props.disabled,
+      onClick: props.onClick,
+      onMouseEnter: () => setHovered(true),
+      onMouseLeave: () => setHovered(false),
+      ...ringProps,
+      style: {
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        flexShrink: 0,
+        border: "none",
+        outline: "none",
+        cursor: "pointer",
+        ...ICON_BUTTON_SIZE[props.size || "sm"],
+        background: hovered && !props.disabled ? BUTTON_VARIANT[variant].hoverBackground : BUTTON_VARIANT[variant].background,
+        color: hovered && !props.disabled ? BUTTON_VARIANT[variant].hoverColor : BUTTON_VARIANT[variant].color,
+        transition: "background " + EASE + ", color " + EASE + ", box-shadow " + EASE,
+        boxShadow: ring ? "var(--focus-ring)" : "none",
+        ...(props.disabled ? { opacity: 0.4, cursor: "not-allowed" } : null),
+        ...props.style,
+      },
+    },
+    props.icon,
+  );
+}
+
+/** 输入框外框（对齐宿主 Input）：focused = accent 边 + 焦点环。 */
+function inputStyle(focused: boolean): Style {
+  return {
+    width: "100%",
+    boxSizing: "border-box",
+    padding: "4px 8px",
+    fontSize: FS.ui,
+    lineHeight: LH.ui,
+    borderRadius: RADIUS.sm,
+    border: "1px solid " + (focused ? "var(--accent)" : "var(--input-border)"),
+    background: "var(--input-bg)",
+    color: textPrimary,
+    outline: "none",
+    boxShadow: focused ? "var(--focus-ring)" : "none",
+    transition: "border-color " + EASE + ", box-shadow " + EASE,
+  };
+}
+
+/** 跟踪焦点态（供无自身编辑态概念的输入框：设置项、搜索框）。 */
+function useFocused(): [boolean, { onFocus: () => void; onBlur: () => void }] {
+  const [focused, setFocused] = React.useState(false);
+  return [focused, { onFocus: () => setFocused(true), onBlur: () => setFocused(false) }];
+}
+
+/** 键盘焦点环（内联样式写不了 :focus-visible：事件 + matches 检测，鼠标点击不亮环）。 */
+function useFocusRing(): [boolean, { onFocus: (e: { currentTarget: Element }) => void; onBlur: () => void }] {
+  const [on, setOn] = React.useState(false);
+  return [on, { onFocus: (e) => setOn(e.currentTarget.matches(":focus-visible")), onBlur: () => setOn(false) }];
+}
+
+/** 单行文本输入（自带焦点态）。 */
+function TextField(props: { value: string; placeholder?: string; style?: Style; onChange: (value: string) => void }) {
+  const [focused, focusProps] = useFocused();
+  return h("input", {
+    value: props.value,
+    placeholder: props.placeholder,
+    onChange: (e: { target: { value: string } }) => props.onChange(e.target.value),
+    ...focusProps,
+    style: { ...inputStyle(focused), ...props.style },
+  });
+}
+
+/** 下拉选择（自带焦点态，样式同输入框）。 */
+function SelectField(props: { value: string; style?: Style; onChange: (value: string) => void; options: Array<{ value: string; label: string }> }) {
+  const [focused, focusProps] = useFocused();
+  return h(
+    "select",
+    {
+      value: props.value,
+      onChange: (e: { target: { value: string } }) => props.onChange(e.target.value),
+      ...focusProps,
+      style: { ...inputStyle(focused), cursor: "pointer", ...props.style },
+    },
+    props.options.map((o) => h("option", { key: o.value, value: o.value }, o.label)),
+  );
+}
+
+/** 单选选项的胶囊按钮：选中 = accent 实底（同宿主 Radio 勾选态），未选中 = 中性底。 */
+function chipStyle(selected: boolean, hovered: boolean): Style {
   return {
     display: "inline-flex",
     alignItems: "center",
-    padding: "3px 12px",
-    fontSize: 12,
-    lineHeight: "18px",
-    borderRadius: 999,
+    padding: "3px 10px",
+    fontSize: FS.caption,
+    lineHeight: LH.caption,
+    fontWeight: 500,
+    borderRadius: RADIUS.sm,
     cursor: "pointer",
     border: "1px solid " + (selected ? "var(--accent)" : borderColor),
-    background: selected ? "color-mix(in srgb, var(--accent) 12%, transparent)" : "var(--bg-secondary)",
-    color: selected ? "var(--accent)" : textSecondary,
-    transition: "background " + TRANSITION + ", border-color " + TRANSITION + ", color " + TRANSITION,
+    background: selected ? "var(--accent)" : hovered ? "var(--hover)" : "var(--bg-tertiary)",
+    color: selected ? "var(--accent-fg)" : hovered ? textPrimary : textSecondary,
+    transition: "background " + EASE + ", border-color " + EASE + ", color " + EASE,
   };
 }
 
-const ICON_BUTTON_STYLE: Record<string, string | number> = {
-  display: "inline-flex",
-  alignItems: "center",
-  justifyContent: "center",
-  width: 20,
-  height: 20,
-  flexShrink: 0,
-  borderRadius: 4,
-  border: "none",
-  background: "transparent",
-  color: textMuted,
-  cursor: "pointer",
-  transition: "color " + TRANSITION + ", background " + TRANSITION,
+/** 单选选项胶囊（自带 hover 态；点选即写）。 */
+function SelectChip(props: { selected: boolean; disabled?: boolean; onClick: () => void; children?: unknown }) {
+  const [hovered, setHovered] = React.useState(false);
+  const [ring, ringProps] = useFocusRing();
+  return h("button", {
+    type: "button",
+    disabled: props.disabled,
+    onClick: props.onClick,
+    onMouseEnter: () => setHovered(true),
+    onMouseLeave: () => setHovered(false),
+    ...ringProps,
+    style: {
+      ...chipStyle(props.selected, hovered && !props.disabled),
+      boxShadow: ring ? "var(--focus-ring)" : "none",
+      ...(props.disabled ? { opacity: 0.5, cursor: "not-allowed" } : null),
+    },
+  }, props.children);
+}
+
+/** 浮层统一视觉（设置面板、行选择下拉）：overlay 底 + 浮起投影。 */
+const POPUP_STYLE: Style = {
+  borderRadius: RADIUS.md,
+  border: "1px solid " + borderColor,
+  background: "var(--bg-overlay)",
+  boxShadow: "var(--shadow-pop)",
 };
 
-/** 浮层统一视觉（设置面板、行选择下拉）。 */
-const POPUP_STYLE: Record<string, string | number> = {
-  borderRadius: 10,
-  border: "1px solid " + borderColor,
-  background: "var(--bg-secondary)",
-  boxShadow: "0 12px 32px rgba(0,0,0,0.28)",
-};
+/** 状态胶囊（对齐宿主 StatusPill）：色点 + 文字双重编码，状态不靠颜色单独表意。 */
+function StatusPill(props: { color: string; label: string }) {
+  return h(
+    "span",
+    { style: { display: "inline-flex", alignItems: "center", gap: 6, fontSize: FS.micro, lineHeight: LH.micro, whiteSpace: "nowrap", color: props.color } },
+    [
+      h("span", { key: "dot", style: { width: 6, height: 6, borderRadius: RADIUS_FULL, flexShrink: 0, background: props.color } }),
+      props.label,
+    ],
+  );
+}
+
+/** 空态（对齐宿主 EmptyState 形态）：图标底座 + 标题 + 说明 + 行动。 */
+function EmptyState(props: { icon?: unknown; title: string; description?: string; action?: unknown; compact?: boolean }) {
+  return h(
+    "div",
+    {
+      style: {
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        textAlign: "center",
+        gap: 8,
+        padding: props.compact ? "16px 12px" : "40px 24px",
+      },
+    },
+    [
+      props.icon
+        ? h(
+            "div",
+            { key: "icon", style: { width: 40, height: 40, borderRadius: RADIUS.md, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, background: "var(--bg-tertiary)", color: textMuted } },
+            props.icon,
+          )
+        : null,
+      h("div", { key: "title", style: { fontSize: FS.body, lineHeight: LH.body, fontWeight: 500, color: textPrimary } }, props.title),
+      props.description
+        ? h("div", { key: "desc", style: { fontSize: FS.ui, lineHeight: LH.ui, color: textMuted, maxWidth: "42ch" } }, props.description)
+        : null,
+      props.action ? h("div", { key: "action", style: { marginTop: 4 } }, props.action) : null,
+    ],
+  );
+}
 
 const IMAGE_GRID_GAP = 4;
 
@@ -278,24 +495,24 @@ const IMAGE_MAX_TILE = 112;
 /** 图片预览框高度：图片多时框内纵向滚动。 */
 const IMAGE_FRAME_HEIGHT = 150;
 
-/** 图片预览框：铺满宽度 + 固定高度（内层纵向滚动）。 */
-const IMAGE_FRAME_STYLE: Record<string, string | number> = {
+/** 图片预览框：铺满宽度 + 固定高度（内层纵向滚动），下沉面。 */
+const IMAGE_FRAME_STYLE: Style = {
   width: "100%",
   maxWidth: "100%",
   height: IMAGE_FRAME_HEIGHT,
   display: "flex",
   flexDirection: "column",
-  borderRadius: 6,
+  borderRadius: RADIUS.sm,
   overflow: "hidden",
   border: "1px solid " + borderColor,
-  background: "var(--bg-secondary)",
+  background: "var(--bg-sunken)",
 };
 
 const NAV_AREA_WIDTH = 72;
 const CONTENT_MAX_WIDTH = 640;
 
 /** 表单内容列（唯一滚动容器，故其滑动条落在本列表最右缘；翻行区是本列内部成员）。 */
-const SCROLL_AREA_STYLE: Record<string, string | number> = {
+const SCROLL_AREA_STYLE: Style = {
   flex: 1,
   minWidth: 0,
   minHeight: 0,
@@ -304,58 +521,56 @@ const SCROLL_AREA_STYLE: Record<string, string | number> = {
   alignItems: "stretch",
 };
 
-const CARD_STYLE: Record<string, string | number> = {
+const CARD_STYLE: Style = {
   maxWidth: CONTENT_MAX_WIDTH,
   margin: "0 auto",
   display: "flex",
   flexDirection: "column",
-  gap: 10,
+  gap: 12,
   paddingBottom: 16,
 };
 
-/** 字段行卡片：label 左列（固定宽）+ 值区伸展；编辑态 accent 描边 + 轻晕圈。 */
-function fieldRowStyle(editing: boolean, hovered: boolean): Record<string, string | number> {
+/** 字段行卡片：label 左列（固定宽）+ 值区伸展；编辑态 accent 描边 + 焦点环。 */
+function fieldRowStyle(editing: boolean, hovered: boolean): Style {
   return {
     display: "flex",
     alignItems: "flex-start",
     gap: 12,
-    padding: "10px 12px",
-    borderRadius: 8,
+    padding: "12px",
+    borderRadius: RADIUS.md,
     border: "1px solid " + (editing ? "var(--accent)" : borderColor),
     background: editing
       ? "color-mix(in srgb, var(--accent) 5%, transparent)"
       : hovered
         ? "var(--hover)"
         : "transparent",
-    boxShadow: editing ? "0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent)" : "none",
-    transition: "border-color " + TRANSITION + ", background " + TRANSITION + ", box-shadow " + TRANSITION,
+    boxShadow: editing ? "var(--focus-ring)" : "none",
+    transition: "border-color " + EASE + ", background " + EASE + ", box-shadow " + EASE,
   };
 }
 
-const FIELD_LABEL_STYLE: Record<string, string | number> = {
+const FIELD_LABEL_STYLE: Style = {
   width: 128,
   flexShrink: 0,
   minWidth: 0,
-  paddingTop: 5,
+  paddingTop: 4,
   display: "flex",
   flexDirection: "column",
-  gap: 1,
+  gap: 2,
 };
 
-const LIGHTBOX_NAV_STYLE: Record<string, string | number> = {
+/** 灯箱指针控件：深色全屏遮罩上的浅色反馈，非主题色（对齐宿主灯箱）。 */
+const LIGHTBOX_HOVER = "rgba(255,255,255,0.1)";
+
+const LIGHTBOX_NAV_STYLE: Style = {
   position: "absolute",
   left: 16,
   top: "50%",
   transform: "translateY(-50%)",
   width: 40,
   height: 40,
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
   border: "none",
-  borderRadius: 999,
-  background: "rgba(0,0,0,0.4)",
-  color: "#fff",
+  borderRadius: RADIUS_FULL,
   cursor: "pointer",
 };
 
@@ -364,7 +579,7 @@ const LIGHTBOX_NAV_STYLE: Record<string, string | number> = {
  * `align-self: stretch` 撑满内容全高、`sticky top: 0` 在滚动时钉住可视位置 ——
  * 既铺满可视高度、又不随内容滚走，且不依赖任何高度测量。箭头恒占位、只切透明度，避免布局跳动。
  */
-const NAV_AREA_STYLE: Record<string, string | number> = {
+const NAV_AREA_STYLE: Style = {
   position: "sticky",
   top: 0,
   zIndex: 5,
@@ -377,24 +592,20 @@ const NAV_AREA_STYLE: Record<string, string | number> = {
   border: "none",
   padding: 0,
   outline: "none",
-  transition: "background " + TRANSITION,
+  transition: "background " + EASE,
 };
 
-const EMPTY_BOX_STYLE: Record<string, string | number> = {
+/** 整视图空态（未开表/载入中）的居中容器。 */
+const EMPTY_VIEW_STYLE: Style = {
   flex: 1,
   minHeight: 0,
   display: "flex",
   alignItems: "center",
   justifyContent: "center",
-  padding: 24,
-  textAlign: "center",
-  fontSize: 13,
-  color: textMuted,
 };
 
 /** 入口：注册表格表单视图（注册随插件启停经 fiber 生命周期撤销）。 */
 export default function apply(ctx: AtelyxCtx): void {
-  const h = React.createElement;
   const table = ctx.table;
   /** 订阅表格变更（fiber 级注册，停用随插件撤销）。 */
   const onTableChanged = (cb: () => void): (() => void) => ctx.events.on("table:changed", cb);
@@ -626,11 +837,11 @@ export default function apply(ctx: AtelyxCtx): void {
     const missingCount = config ? config.fields.length - rows.filter((r) => r.target).length : 0;
     return h("div", { style: { display: "flex", flexDirection: "column", gap: 8 } }, [
       h("div", { key: "h", style: { display: "flex", alignItems: "center", gap: 8 } }, [
-        h("span", { key: "t", style: { fontSize: 12, fontWeight: 600, color: textPrimary } }, "表单设置"),
+        h("span", { key: "t", style: { fontSize: FS.caption, lineHeight: LH.caption, fontWeight: 600, color: textPrimary } }, "表单设置"),
         h("span", { key: "sp", style: { flex: 1 } }),
         h(
           "span",
-          { key: "c", style: { fontSize: 11, color: textMuted, fontVariantNumeric: "tabular-nums" } },
+          { key: "c", style: { fontSize: FS.micro, lineHeight: LH.micro, color: textMuted, fontVariantNumeric: "tabular-nums" } },
           "启用 " + rows.filter((r) => r.target).length + " / 共 " + fields.length + " 个字段",
         ),
       ]),
@@ -645,56 +856,53 @@ export default function apply(ctx: AtelyxCtx): void {
                   flexDirection: "column",
                   gap: 4,
                   padding: "6px 8px",
-                  borderRadius: 6,
+                  borderRadius: RADIUS.sm,
                   border: "1px solid " + borderColor,
-                  background: target ? "var(--bg-primary)" : "transparent",
+                  background: target ? "color-mix(in srgb, var(--text-primary) 4%, transparent)" : "transparent",
                   opacity: target ? 1 : 0.65,
-                  transition: "background " + TRANSITION,
+                  transition: "background " + EASE,
                 },
               },
               [
                 h("div", { key: "row", style: { display: "flex", alignItems: "center", gap: 6 } }, [
-                  h(
-                    "button",
-                    {
-                      key: "sw",
-                      onClick: () => setFieldEnabled(field.id, !target),
-                      title: target ? "从表单中移出该字段" : "把该字段加入表单",
-                      style: { ...ICON_BUTTON_STYLE, color: target ? "var(--accent)" : textMuted },
-                    },
-                    target ? h(EyeIcon, { size: 14 }) : h(EyeOffIcon, { size: 14 }),
-                  ),
-                  h("span", { key: "n", style: { flex: 1, fontSize: 12, color: textPrimary, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, field.name),
-                  h("span", { key: "ty", style: { fontSize: 11, color: textMuted } }, describeType(field)),
+                  h(IconButton, {
+                    key: "sw",
+                    size: "xs",
+                    label: target ? "从表单中移出该字段" : "把该字段加入表单",
+                    icon: target ? h(EyeIcon, { size: 14 }) : h(EyeOffIcon, { size: 14 }),
+                    onClick: () => setFieldEnabled(field.id, !target),
+                    style: target ? { color: "var(--accent)" } : undefined,
+                  }),
+                  h("span", { key: "n", style: { flex: 1, fontSize: FS.caption, lineHeight: LH.caption, color: textPrimary, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, field.name),
+                  h("span", { key: "ty", style: { fontSize: FS.micro, lineHeight: LH.micro, color: textMuted } }, describeType(field)),
                   // 排序只在已启用字段间有效
                   target
                     ? [
-                        h("button", { key: "up", onClick: () => moveFieldConfig(field.id, -1), style: ICON_BUTTON_STYLE, title: "上移" }, h(UpIcon, { size: 13 })),
-                        h("button", { key: "down", onClick: () => moveFieldConfig(field.id, 1), style: ICON_BUTTON_STYLE, title: "下移" }, h(DownIcon, { size: 13 })),
+                        h(IconButton, { key: "up", size: "xs", label: "上移", icon: h(UpIcon, { size: 13 }), onClick: () => moveFieldConfig(field.id, -1) }),
+                        h(IconButton, { key: "down", size: "xs", label: "下移", icon: h(DownIcon, { size: 13 }), onClick: () => moveFieldConfig(field.id, 1) }),
                       ]
                     : null,
                 ]),
                 target
                   ? h("div", { key: "cfg", style: { display: "flex", alignItems: "center", gap: 6 } }, [
-                      h("input", {
+                      h(TextField, {
                         key: "hint",
                         value: target.hint || "",
                         placeholder: "填写提示",
-                        onChange: (e: { target: { value: string } }) => patchFieldConfig(field.id, { hint: e.target.value }),
-                        style: { ...INPUT_STYLE, flex: 1, fontSize: 12, padding: "4px 6px" },
+                        onChange: (value: string) => patchFieldConfig(field.id, { hint: value }),
+                        style: { flex: 1, width: "auto", padding: "2px 6px", fontSize: FS.caption, lineHeight: LH.caption },
                       }),
                       field.type === "singleSelect"
-                        ? h(
-                            "select",
-                            {
-                              key: "style",
-                              value: target.selectStyle || "radio",
-                              onChange: (e: { target: { value: string } }) =>
-                                patchFieldConfig(field.id, { selectStyle: e.target.value === "dropdown" ? "dropdown" : "radio" }),
-                              style: { ...INPUT_STYLE, width: 84, fontSize: 12, padding: "4px 6px", cursor: "pointer" },
-                            },
-                            [h("option", { key: "r", value: "radio" }, "按钮"), h("option", { key: "d", value: "dropdown" }, "下拉")],
-                          )
+                        ? h(SelectField, {
+                            key: "style",
+                            value: target.selectStyle || "radio",
+                            onChange: (value: string) => patchFieldConfig(field.id, { selectStyle: value === "dropdown" ? "dropdown" : "radio" }),
+                            options: [
+                              { value: "radio", label: "按钮" },
+                              { value: "dropdown", label: "下拉" },
+                            ],
+                            style: { width: 84, padding: "2px 6px", fontSize: FS.caption, lineHeight: LH.caption },
+                          })
                         : null,
                     ])
                   : null,
@@ -703,11 +911,11 @@ export default function apply(ctx: AtelyxCtx): void {
           )
         : h(
             "div",
-            { key: "empty", style: { fontSize: 11, color: textMuted } },
+            { key: "empty", style: { fontSize: FS.micro, lineHeight: LH.micro, color: textMuted } },
             fields.length === 0 ? "该表格还没有字段，请先在表格视图添加字段。" : "正在载入表单配置…",
           ),
       missingCount > 0
-        ? h("div", { key: "missing", style: { fontSize: 11, color: textMuted } }, "有 " + missingCount + " 个已配置字段已从表格中删除，配置保留但不再显示。")
+        ? h("div", { key: "missing", style: { fontSize: FS.micro, lineHeight: LH.micro, color: textMuted } }, "有 " + missingCount + " 个已配置字段已从表格中删除，配置保留但不再显示。")
         : null,
     ]);
   }
@@ -721,6 +929,7 @@ export default function apply(ctx: AtelyxCtx): void {
     const snap = useSettingsSnapshot();
     const [anchor, setAnchor] = React.useState(null as { right: number; top: number } | null);
     const [hovered, setHovered] = React.useState(false);
+    const [ring, ringProps] = useFocusRing();
     const triggerRef = React.useRef<HTMLElement | null>(null);
     const boxRef = React.useRef<HTMLElement | null>(null);
 
@@ -752,29 +961,20 @@ export default function apply(ctx: AtelyxCtx): void {
         {
           key: "trigger",
           ref: triggerRef,
+          type: "button",
           onClick: (e: { currentTarget: HTMLElement }) => {
             const rect = e.currentTarget.getBoundingClientRect();
             setAnchor((prev) => (prev ? null : { right: rect.right, top: rect.bottom + 4 }));
           },
           onMouseEnter: () => setHovered(true),
           onMouseLeave: () => setHovered(false),
+          ...ringProps,
           title: "配置参与表单填写的字段",
+          // 展开态是动态条件色（对齐宿主「···」菜单触发器），按 style 覆盖 variant 色
           style: {
-            display: "inline-flex",
-            alignItems: "center",
-            gap: 5,
-            padding: "3px 9px",
-            fontSize: 12,
-            borderRadius: 6,
-            border: "1px solid " + (open ? "var(--accent)" : "transparent"),
-            background: open
-              ? "color-mix(in srgb, var(--accent) 12%, transparent)"
-              : hovered
-                ? "var(--hover)"
-                : "transparent",
-            color: open ? "var(--accent)" : textSecondary,
-            cursor: "pointer",
-            transition: "background " + TRANSITION + ", color " + TRANSITION,
+            ...buttonStyle("subtle", "sm", hovered),
+            boxShadow: ring ? "var(--focus-ring)" : "none",
+            ...(open ? { color: "var(--accent)", background: "var(--accent-soft)" } : null),
           },
         },
         [h(SlidersIcon, { key: "i", size: 13 }), h("span", { key: "t" }, "表单设置")],
@@ -794,7 +994,7 @@ export default function apply(ctx: AtelyxCtx): void {
                 width: 272,
                 maxHeight: "60vh",
                 overflowY: "auto",
-                padding: 10,
+                padding: 12,
               },
             },
             h(FormSettingsPanel, { key: "panel-body" }),
@@ -847,12 +1047,14 @@ export default function apply(ctx: AtelyxCtx): void {
       { ref: boxRef, style: { position: "relative", display: "flex", alignItems: "center", flexShrink: 0 } },
       [
         h(
-          "button",
+          Button,
           {
             key: "trigger",
+            variant: "ghost",
+            size: "sm",
             onClick: () => setOpen((v) => !v),
-            style: { ...buttonStyle(false), maxWidth: 240 },
             title: "选择要编辑的行",
+            style: { maxWidth: 240 },
           },
           [
             h("span", { key: "t", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } },
@@ -876,27 +1078,28 @@ export default function apply(ctx: AtelyxCtx): void {
                   width: 320,
                   maxHeight: 320,
                   overflow: "auto",
-                  padding: 6,
+                  padding: 8,
                 },
               },
               [
-                h("input", {
+                h(TextField, {
                   key: "q",
                   value: query,
                   placeholder: "搜索行内容…",
-                  onChange: (e: { target: { value: string } }) => setQuery(e.target.value),
-                  style: { ...INPUT_STYLE, marginBottom: 6 },
+                  onChange: (value: string) => setQuery(value),
+                  style: { marginBottom: 6 },
                 }),
                 h(
                   "div",
                   { key: "items", style: { display: "flex", flexDirection: "column", gap: 2 } },
                   matched.list.length === 0
-                    ? h("div", { style: { padding: "6px 8px", fontSize: 12, color: textMuted } }, "没有匹配的行")
+                    ? h("div", { style: { padding: "6px 8px", fontSize: FS.caption, lineHeight: LH.caption, color: textMuted } }, "没有匹配的行")
                     : matched.list.map((item) =>
                         h(
                           "button",
                           {
                             key: item.id,
+                            type: "button",
                             onClick: () => {
                               props.onPick(item.id);
                               setOpen(false);
@@ -908,10 +1111,12 @@ export default function apply(ctx: AtelyxCtx): void {
                               display: "flex",
                               alignItems: "center",
                               gap: 6,
-                              padding: "5px 8px",
-                              fontSize: 12,
+                              width: "100%",
+                              padding: "4px 8px",
+                              fontSize: FS.caption,
+                              lineHeight: LH.caption,
                               textAlign: "left",
-                              borderRadius: 6,
+                              borderRadius: RADIUS.sm,
                               border: "none",
                               cursor: "pointer",
                               background:
@@ -921,11 +1126,11 @@ export default function apply(ctx: AtelyxCtx): void {
                                     ? "var(--hover)"
                                     : "transparent",
                               color: textPrimary,
-                              transition: "background " + TRANSITION,
+                              transition: "background " + EASE,
                             },
                           },
                           [
-                            h("span", { key: "c", style: { width: 8, height: 8, borderRadius: 4, flexShrink: 0, background: "var(--accent)", opacity: item.id === props.selectedRowId ? 1 : 0 } }),
+                            h("span", { key: "c", style: { width: 8, height: 8, borderRadius: RADIUS_FULL, flexShrink: 0, background: "var(--accent)", opacity: item.id === props.selectedRowId ? 1 : 0 } }),
                             h("span", { key: "n", style: { flexShrink: 0, color: textMuted, fontVariantNumeric: "tabular-nums" } }, item.label),
                             h("span", { key: "l", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, item.detail),
                           ],
@@ -935,7 +1140,7 @@ export default function apply(ctx: AtelyxCtx): void {
                 matched.total > matched.list.length
                   ? h(
                       "div",
-                      { key: "more", style: { padding: "6px 8px", fontSize: 11, color: textMuted } },
+                      { key: "more", style: { padding: "6px 8px", fontSize: FS.micro, lineHeight: LH.micro, color: textMuted } },
                       "仅显示前 " + ROW_PICKER_LIMIT + " 条（共 " + matched.total + " 条匹配，可搜索缩小范围）",
                     )
                   : null,
@@ -995,6 +1200,34 @@ export default function apply(ctx: AtelyxCtx): void {
     onIndex: (index: number) => void;
     onClose: () => void;
   }
+  /** 灯箱指针按钮：深色全屏遮罩上的浅色 hover 反馈（非主题色，对齐宿主灯箱）。 */
+  function LightboxButton(props: { title: string; onClick: (e: { stopPropagation: () => void }) => void; style?: Style; children?: unknown }) {
+    const [hovered, setHovered] = React.useState(false);
+    return h(
+      "button",
+      {
+        type: "button",
+        title: props.title,
+        "aria-label": props.title,
+        onClick: props.onClick,
+        onMouseEnter: () => setHovered(true),
+        onMouseLeave: () => setHovered(false),
+        style: {
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          border: "none",
+          cursor: "pointer",
+          color: "var(--text-primary)",
+          background: hovered ? LIGHTBOX_HOVER : "transparent",
+          transition: "background " + EASE,
+          ...props.style,
+        },
+      },
+      props.children,
+    );
+  }
+
   function ImageLightbox(props: LightboxProps) {
     const count = props.urls.length;
     const latest = React.useRef(props);
@@ -1035,10 +1268,11 @@ export default function apply(ctx: AtelyxCtx): void {
                 onClick: (e: { stopPropagation: () => void }) => e.stopPropagation(),
                 style: {
                   padding: "24px 32px",
-                  borderRadius: 10,
+                  borderRadius: RADIUS.md,
                   border: "1px solid rgba(255,255,255,0.25)",
                   color: "rgba(255,255,255,0.8)",
-                  fontSize: 13,
+                  fontSize: FS.ui,
+                  lineHeight: LH.ui,
                 },
               },
               "这张图片读取失败",
@@ -1052,7 +1286,7 @@ export default function apply(ctx: AtelyxCtx): void {
               style: { maxWidth: "90vw", maxHeight: "90vh", objectFit: "contain", userSelect: "none" },
             }),
         h(
-          "button",
+          LightboxButton,
           {
             key: "close",
             onClick: (e: { stopPropagation: () => void }) => {
@@ -1060,7 +1294,7 @@ export default function apply(ctx: AtelyxCtx): void {
               props.onClose();
             },
             title: "关闭 (Esc)",
-            style: { position: "absolute", top: 16, right: 16, width: 36, height: 36, display: "flex", alignItems: "center", justifyContent: "center", border: "none", borderRadius: 6, background: "rgba(0,0,0,0.4)", color: "#fff", cursor: "pointer" },
+            style: { position: "absolute", top: 16, right: 16, width: 36, height: 36, borderRadius: RADIUS.sm },
           },
           h(CloseIcon, { size: 20 }),
         ),
@@ -1070,13 +1304,13 @@ export default function apply(ctx: AtelyxCtx): void {
               { key: "nav", onClick: (e: { stopPropagation: () => void }) => e.stopPropagation() },
               [
                 h(
-                  "button",
+                  LightboxButton,
                   { key: "prev", onClick: () => props.onIndex((props.index - 1 + count) % count), title: "上一张 (←)", style: LIGHTBOX_NAV_STYLE },
                   h(ArrowIcon, { size: 24, dir: "left" }),
                 ),
-                h("div", { key: "n", style: { position: "absolute", bottom: 16, left: "50%", transform: "translateX(-50%)", padding: "2px 10px", borderRadius: 999, fontSize: 12, background: "rgba(0,0,0,0.6)", color: "#fff", fontVariantNumeric: "tabular-nums" } }, props.index + 1 + " / " + count),
+                h("div", { key: "n", style: { position: "absolute", bottom: 16, left: "50%", transform: "translateX(-50%)", padding: "2px 10px", borderRadius: RADIUS_FULL, fontSize: FS.caption, lineHeight: LH.caption, background: "rgba(0,0,0,0.6)", color: "var(--text-primary)", fontVariantNumeric: "tabular-nums" } }, props.index + 1 + " / " + count),
                 h(
-                  "button",
+                  LightboxButton,
                   { key: "next", onClick: () => props.onIndex((props.index + 1) % count), title: "下一张 (→)", style: { ...LIGHTBOX_NAV_STYLE, left: "auto", right: 16 } },
                   h(ArrowIcon, { size: 24, dir: "right" }),
                 ),
@@ -1107,11 +1341,11 @@ export default function apply(ctx: AtelyxCtx): void {
           width: props.size,
           height: props.size,
           flexShrink: 0,
-          borderRadius: 6,
+          borderRadius: RADIUS.sm,
           overflow: "hidden",
           border: "1px solid " + (hover ? "var(--accent)" : borderColor),
-          background: "var(--hover)",
-          transition: "border-color " + TRANSITION,
+          background: "var(--bg-tertiary)",
+          transition: "border-color " + EASE,
         },
       },
       [
@@ -1119,19 +1353,21 @@ export default function apply(ctx: AtelyxCtx): void {
           "button",
           {
             key: "img",
+            type: "button",
             onClick: props.onOpen,
             title: "点击查看原图（第 " + (props.index + 1) + " 张）",
             style: { display: "block", width: "100%", height: "100%", padding: 0, border: "none", background: "transparent", cursor: "zoom-in" },
           },
           props.url
             ? h("img", { src: props.url, alt: String(props.index + 1), draggable: false, style: { width: "100%", height: "100%", objectFit: "cover", display: "block" } })
-            : h("span", { style: { fontSize: 11, color: textMuted } }, "加载中…"),
+            : h("span", { style: { fontSize: FS.micro, lineHeight: LH.micro, color: textMuted } }, "加载中…"),
         ),
         props.canRemove && hover
           ? h(
               "button",
               {
                 key: "rm",
+                type: "button",
                 onClick: (e: { stopPropagation: () => void }) => {
                   e.stopPropagation();
                   props.onRemove();
@@ -1148,7 +1384,7 @@ export default function apply(ctx: AtelyxCtx): void {
                   justifyContent: "center",
                   padding: 0,
                   border: "none",
-                  borderRadius: 999,
+                  borderRadius: RADIUS_FULL,
                   background: "rgba(0,0,0,0.55)",
                   color: "#fff",
                   cursor: "pointer",
@@ -1200,7 +1436,7 @@ export default function apply(ctx: AtelyxCtx): void {
     if (entries.length === 0) {
       return h(
         "div",
-        { style: { padding: "8px 10px", borderRadius: 6, border: "1px dashed " + borderColor, fontSize: 11, color: textMuted } },
+        { style: { padding: "8px 12px", borderRadius: RADIUS.sm, border: "1px dashed " + borderColor, fontSize: FS.micro, lineHeight: LH.micro, color: textMuted } },
         props.hasRow ? "该行此字段暂无图片" : "选中一行后显示该行的图片",
       );
     }
@@ -1261,9 +1497,6 @@ export default function apply(ctx: AtelyxCtx): void {
   }
   function ArrowIcon(props: { size?: number; dir: "left" | "right" }) {
     return h(Svg, { size: props.size }, h("path", { d: props.dir === "left" ? "M15 18l-6-6 6-6" : "M9 6l6 6-6 6" }));
-  }
-  function CheckIcon(props: { size?: number }) {
-    return h(Svg, { size: props.size }, h("path", { d: "M20 6L9 17l-5-5" }));
   }
   function UndoIcon(props: { size?: number }) {
     return h(Svg, { size: props.size }, h("path", { d: "M3 7v6h6" }), h("path", { d: "M3 13a9 9 0 1 0 3-7" }));
@@ -1605,10 +1838,10 @@ export default function apply(ctx: AtelyxCtx): void {
     }, [newRow]);
 
     if (!tableFile) {
-      return h("div", { style: EMPTY_BOX_STYLE }, "未打开表格");
+      return h("div", { style: EMPTY_VIEW_STYLE }, h(EmptyState, { key: "e", icon: h(FormIcon, { size: 20 }), title: "未打开表格" }));
     }
     if (!snap || !config) {
-      return h("div", { style: EMPTY_BOX_STYLE }, "正在载入表单…");
+      return h("div", { style: EMPTY_VIEW_STYLE }, h(EmptyState, { key: "e", icon: h(FormIcon, { size: 20 }), title: "正在载入表单…" }));
     }
 
     const peerColor = (rowId && peerColorByRowId[rowId]) || null;
@@ -1622,31 +1855,19 @@ export default function apply(ctx: AtelyxCtx): void {
         [
           h(RowPicker, { key: "picker", rows, fields, selectedRowId, currentRowId: rowId, onPick: pickRow }),
           h("div", { key: "nav", style: { display: "flex", alignItems: "center", gap: 2 } }, [
-            h(
-              "button",
-              { key: "prev", onClick: () => moveRow(-1), disabled: rows.length === 0, title: "上一行", style: { ...ICON_BUTTON_STYLE, width: 24, height: 24, borderRadius: 6, border: "1px solid " + borderColor, color: rows.length === 0 ? textMuted : textSecondary } },
-              h(ArrowIcon, { size: 14, dir: "left" }),
-            ),
-            h(
-              "button",
-              { key: "next", onClick: () => moveRow(1), disabled: rows.length === 0, title: "下一行", style: { ...ICON_BUTTON_STYLE, width: 24, height: 24, borderRadius: 6, border: "1px solid " + borderColor, color: rows.length === 0 ? textMuted : textSecondary } },
-              h(ArrowIcon, { size: 14, dir: "right" }),
-            ),
+            h(IconButton, { key: "prev", variant: "ghost", size: "sm", label: "上一行", icon: h(ArrowIcon, { size: 14, dir: "left" }), disabled: rows.length === 0, onClick: () => moveRow(-1) }),
+            h(IconButton, { key: "next", variant: "ghost", size: "sm", label: "下一行", icon: h(ArrowIcon, { size: 14, dir: "right" }), disabled: rows.length === 0, onClick: () => moveRow(1) }),
           ]),
-          h("button", { key: "new", onClick: addRowExplicitly, style: buttonStyle(false), title: "新增一行空行" }, [
+          h(Button, { key: "new", variant: "ghost", size: "sm", onClick: addRowExplicitly, title: "新增一行空行" }, [
             h(PlusIcon, { key: "i", size: 12 }),
             h("span", { key: "t" }, "新增一行"),
           ]),
           h("span", { key: "sp", style: { flex: 1 } }),
           peerColor
-            ? h(
-                "span",
-                { key: "peers", style: { display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: textMuted } },
-                [
-                  h("span", { key: "dot", style: { width: 8, height: 8, borderRadius: 4, background: peerColor } }),
-                  h("span", { key: "t" }, "他人正在编辑本行"),
-                ],
-              )
+            ? h("span", { key: "peers", style: { display: "flex", alignItems: "center", gap: 6, fontSize: FS.micro, lineHeight: LH.micro, color: textMuted } }, [
+                h("span", { key: "dot", style: { width: 6, height: 6, borderRadius: RADIUS_FULL, background: peerColor } }),
+                h("span", { key: "t" }, "他人正在编辑本行"),
+              ])
             : null,
         ],
       );
@@ -1655,44 +1876,45 @@ export default function apply(ctx: AtelyxCtx): void {
     const renderHeader = () =>
       h("div", { style: { display: "flex", flexDirection: "column", gap: 8 } }, [
         h("div", { key: "t", style: { display: "flex", alignItems: "baseline", gap: 8 } }, [
-          h("span", { key: "n", style: { fontSize: 18, fontWeight: 600, color: textPrimary } }, rowId && currentRowIndex > 0 ? "第 " + currentRowIndex + " 行" : "新增行"),
-          h("span", { key: "r", style: { fontSize: 12, color: textMuted, fontVariantNumeric: "tabular-nums" } }, "共 " + rows.length + " 行"),
+          h("span", { key: "n", style: { fontSize: FS.h2, lineHeight: LH.h2, fontWeight: 600, color: textPrimary } }, rowId && currentRowIndex > 0 ? "第 " + currentRowIndex + " 行" : "新增行"),
+          h("span", { key: "r", style: { fontSize: FS.caption, lineHeight: LH.caption, color: textMuted, fontVariantNumeric: "tabular-nums" } }, "共 " + rows.length + " 行"),
         ]),
         rows.length === 0
           ? h(
               "div",
-              { key: "er", style: { display: "flex", alignItems: "center", gap: 8, padding: "10px 12px", borderRadius: 8, border: "1px dashed " + borderColor, fontSize: 12, color: textMuted } },
+              { key: "er", style: { display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", borderRadius: RADIUS.sm, border: "1px dashed " + borderColor, fontSize: FS.caption, lineHeight: LH.caption, color: textMuted } },
               [
                 h(FormIcon, { key: "i", size: 16 }),
                 h("span", { key: "t", style: { flex: 1 } }, "表格还没有数据行——填写下方第一个值，即会自动在表格末尾新增一行"),
-                h("button", { key: "b", onClick: addRowExplicitly, style: buttonStyle(false) }, "新增空行"),
+                h(Button, { key: "b", variant: "ghost", size: "sm", onClick: addRowExplicitly }, "新增空行"),
               ],
             )
           : rowId
             ? null
-            : h("div", { key: "s", style: { fontSize: 12, color: textMuted } }, "填写第一个值时会自动在表格末尾新增一行，之后逐格写入"),
+            : h("div", { key: "s", style: { fontSize: FS.caption, lineHeight: LH.caption, color: textMuted } }, "填写第一个值时会自动在表格末尾新增一行，之后逐格写入"),
       ]);
 
     const renderConflict = () =>
       h(
         "div",
-        { style: { display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", fontSize: 12, borderRadius: 8, border: "1px solid " + borderColor, background: "color-mix(in srgb, var(--accent) 6%, var(--bg-secondary))", color: textPrimary } },
+        { style: { display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", fontSize: FS.caption, lineHeight: LH.caption, borderRadius: RADIUS.sm, border: "1px solid " + borderColor, background: "color-mix(in srgb, var(--accent) 6%, var(--bg-secondary))", color: textPrimary } },
         [
           h("span", { key: "t", style: { flex: 1 } }, conflict),
-          h("button", { key: "x", onClick: () => setConflict(null), style: buttonStyle(false) }, "知道了"),
+          h(Button, { key: "x", variant: "secondary", size: "sm", onClick: () => setConflict(null) }, "知道了"),
         ],
       );
 
     const renderFooter = () =>
-      h("div", { style: { display: "flex", alignItems: "center", gap: 8, marginTop: 2, fontSize: 11, color: textMuted, flexWrap: "wrap" } }, [
+      h("div", { style: { display: "flex", alignItems: "center", gap: 8, marginTop: 4, flexWrap: "wrap" } }, [
         savedAt > 0
-          ? h("span", { key: "st", style: { display: "flex", alignItems: "center", gap: 4, color: saveState === "saved" ? "var(--accent)" : textMuted } }, [
-              h(CheckIcon, { key: "i", size: 12 }),
-              h("span", { key: "t" }, saveState === "saved" ? "已写入表格" : "已" + saveState.slice("created:".length) + "新增，继续填写"),
-            ])
+          ? h(StatusPill, {
+              key: "st",
+              color: "var(--success)",
+              label: saveState === "saved" ? "已写入表格" : "已" + saveState.slice("created:".length) + "新增，继续填写",
+            })
           : null,
         newRow && canUndoNewRow
-          ? h("button", { key: "undo", onClick: undoNewRow, style: { ...buttonStyle(false), padding: "3px 8px" }, title: "撤销本次新增（该行内容未被改动时才可用）" }, [
+          ? h(Button, { key: "undo", variant: "ghost", size: "sm", onClick: undoNewRow, title: "撤销本次新增（该行内容未被改动时才可用）" }, [
               h(UndoIcon, { key: "i", size: 12 }),
               h("span", { key: "t" }, "撤销本次新增"),
             ])
@@ -1742,15 +1964,13 @@ export default function apply(ctx: AtelyxCtx): void {
               renderHeader(),
               conflict ? renderConflict() : null,
               fieldRows.length === 0
-                ? h(
-                    "div",
-                    { key: "empty", style: { display: "flex", flexDirection: "column", alignItems: "center", gap: 8, padding: 24, borderRadius: 10, border: "1px dashed " + borderColor, fontSize: 13, color: textMuted, textAlign: "center" } },
-                    [
-                      h(FormIcon, { key: "i", size: 24 }),
-                      h("div", { key: "t" }, "当前表格没有可显示的字段"),
-                      h("div", { key: "b", style: { fontSize: 11 } }, "用表格工具条右上角的「表单设置」配置参与填写的字段"),
-                    ],
-                  )
+                ? h(EmptyState, {
+                    key: "empty",
+                    compact: true,
+                    icon: h(FormIcon, { size: 20 }),
+                    title: "当前表格没有可显示的字段",
+                    description: "用表格工具条右上角的「表单设置」配置参与填写的字段",
+                  })
                 : fieldRows.map(renderFieldRow),
               renderFooter(),
             ]),
@@ -1818,15 +2038,11 @@ export default function apply(ctx: AtelyxCtx): void {
     }, [props.editing, props.escapeSignal]);
 
     const labelNode = h("div", { key: "label", style: FIELD_LABEL_STYLE }, [
-      h("span", { key: "n", style: { fontSize: 12, color: textSecondary, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, props.field.name),
-      h("span", { key: "ty", style: { fontSize: 11, color: textMuted } }, describeType(props.field)),
+      h("span", { key: "n", style: { fontSize: FS.caption, lineHeight: LH.caption, color: textSecondary, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, props.field.name),
+      h("span", { key: "ty", style: { fontSize: FS.micro, lineHeight: LH.micro, color: textMuted } }, describeType(props.field)),
     ]);
-    const inputStyle: Record<string, string | number> = {
-      ...INPUT_STYLE,
-      borderRadius: 4,
-      fontSize: 13,
-      cursor: props.editing ? "text" : "default",
-    };
+    // 编辑态即焦点态：进入编辑 = 聚焦（focusRef 同步落焦），故焦点样式直接由 editing 驱动
+    const controlStyle = { ...inputStyle(props.editing), cursor: props.editing ? "text" : "default" };
     const onEsc = (e: { key: string; stopPropagation: () => void }) => {
       if (e.key !== "Escape") return;
       e.stopPropagation();
@@ -1866,7 +2082,7 @@ export default function apply(ctx: AtelyxCtx): void {
             props.onCommit(input);
           }
         },
-        style: { ...inputStyle, resize: "vertical", fontFamily: "inherit" },
+        style: { ...controlStyle, padding: "6px 8px", resize: "vertical", fontFamily: "inherit" },
       });
     } else if (props.field.type === "number" || props.field.type === "duration") {
       // 只把合法数字串交给 number 输入（否则该输入无法显示、React 报受控告警）
@@ -1883,46 +2099,42 @@ export default function apply(ctx: AtelyxCtx): void {
           onChange: (e: { target: { value: string } }) => setInput(e.target.value),
           onBlur,
           onKeyDown: onEsc,
-          style: { ...inputStyle, width: 200 },
+          style: { ...controlStyle, width: 200 },
         }),
-        props.field.type === "duration" ? h("span", { key: "u", style: { fontSize: 12, color: textMuted } }, "秒") : null,
+        props.field.type === "duration" ? h("span", { key: "u", style: { fontSize: FS.caption, lineHeight: LH.caption, color: textMuted } }, "秒") : null,
       ]);
     } else if (props.selectStyle === "dropdown") {
-      control = h(
-        "select",
-        {
-          key: "e",
-          value: input,
-          onChange: (e: { target: { value: string } }) => {
-            setInput(e.target.value);
-            props.onCommit(e.target.value); // 点选即写
-          },
-          style: { ...inputStyle, cursor: "pointer" },
+      control = h(SelectField, {
+        key: "e",
+        value: input,
+        onChange: (value: string) => {
+          setInput(value);
+          props.onCommit(value); // 点选即写
         },
-        [h("option", { key: "", value: "" }, "（空）")].concat(
-          (props.field.options || []).map((option) => h("option", { key: option, value: option }, option)),
+        options: [{ value: "", label: "（空）" }].concat(
+          (props.field.options || []).map((option) => ({ value: option, label: option })),
         ),
-      );
+      });
     } else {
       // 选项胶囊：点选即写；「清空」显式置空。新增态下不响应（避免误点建行）
       const options = props.field.options || [];
       control = h(
         "div",
-        { key: "e", style: { display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, opacity: props.canUseButtons ? 1 : 0.6 } },
+        { key: "e", style: { display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, opacity: props.canUseButtons ? 1 : 0.5 } },
         [
-          h("button", {
+          h(SelectChip, {
             key: "__clear",
+            selected: input === "",
             disabled: !props.canUseButtons,
             onClick: props.onClear,
-            style: chipStyle(input === ""),
           }, "清空"),
         ].concat(
           options.map((option) =>
-            h("button", {
+            h(SelectChip, {
               key: option,
+              selected: input === option,
               disabled: !props.canUseButtons,
               onClick: () => props.onCommit(option),
-              style: chipStyle(input === option),
             }, option),
           ),
         ),
@@ -1939,7 +2151,7 @@ export default function apply(ctx: AtelyxCtx): void {
     );
   }
 
-  function HoverArea(props: { areaStyle: Record<string, string | number>; title: string; onClick: () => void; children: unknown }) {
+  function HoverArea(props: { areaStyle: Style; title: string; onClick: () => void; children: unknown }) {
     const [hover, setHover] = React.useState(false);
     return h(
       "button",
@@ -1956,7 +2168,7 @@ export default function apply(ctx: AtelyxCtx): void {
           cursor: "pointer",
         },
       },
-      h("span", { style: { display: "flex", alignItems: "center", justifyContent: "center", opacity: hover ? 1 : 0, transition: "opacity " + TRANSITION } }, props.children),
+      h("span", { style: { display: "flex", alignItems: "center", justifyContent: "center", opacity: hover ? 1 : 0, transition: "opacity " + EASE } }, props.children),
     );
   }
 
@@ -1972,8 +2184,8 @@ export default function apply(ctx: AtelyxCtx): void {
   function ImageRow(props: ImageRowProps) {
     return h("div", { style: fieldRowStyle(false, false) }, [
       h("div", { key: "label", style: FIELD_LABEL_STYLE }, [
-        h("span", { key: "n", style: { fontSize: 12, color: textSecondary, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, props.name),
-        h("span", { key: "ty", style: { fontSize: 11, color: textMuted } }, props.canRemove ? "图片" : "图片"),
+        h("span", { key: "n", style: { fontSize: FS.caption, lineHeight: LH.caption, color: textSecondary, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, props.name),
+        h("span", { key: "ty", style: { fontSize: FS.micro, lineHeight: LH.micro, color: textMuted } }, "图片"),
       ]),
       h("div", { key: "c", style: { flex: 1, minWidth: 0 } }, [
         h(ImagePreview, { key: "img", entries: props.entries, hasRow: props.hasRow, canRemove: props.canRemove, onRemove: props.onRemove }),

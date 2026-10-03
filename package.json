@@ -1,6 +1,6 @@
 {
   "name": "com.atelyx.table-form",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "main": "index.ts",
   "description": "把多维表格的行变成可填写的表单：字段按类型渲染（文本/数字/时长/单选/图片），支持新增行与编辑已有行、移除图片单元格的图片引用，填写配置（字段取舍/提示/排序/单选渲染）按表格各自保存。提交走宿主表格数据服务，与表格视图、协作通道实时互通。\n\n启用后表格工具条视图下拉菜单出现「表格表单」选项。",
   "author": "Atelyx",
@@ -10,7 +10,7 @@
     "name": "表格表单",
     "type": "tableview",
     "scope": "app",
-    "atelyxVersionMin": "0.4.3",
+    "atelyxVersionMin": "0.5.0",
     "tagline": "多维表格的表单视图：按字段配置填写，提交新增或更新行",
     "declares": ["table", "state", "notification"],
     "permissions": {
