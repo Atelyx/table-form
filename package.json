@@ -11,12 +11,6 @@
     "type": "tableview",
     "scope": "app",
     "atelyxVersionMin": "0.5.0",
-    "tagline": "多维表格的表单视图：按字段配置填写，提交新增或更新行",
-    "declares": ["table", "state", "notification"],
-    "permissions": {
-      "table": "读取当前表格的行/字段/选中行与图片，新增行并按字段写入单元格值（表单提交），移除图片单元格的图片引用",
-      "state": "读写本插件的表单配置（按表格文件分别保存字段取舍/提示/顺序）",
-      "notification": "提交或保存失败、并发冲突、图片读取失败时给出提示"
-    }
+    "tagline": "多维表格的表单视图：按字段配置填写，提交新增或更新行"
   }
 }
