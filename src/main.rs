@@ -24,8 +24,8 @@ use atelyx_plugin_sdk::protocol::event::{self, PublishParams, TableChangedPayloa
 use atelyx_plugin_sdk::protocol::method::{
     ContributionSlot, NotificationLevel, SurfaceAttachedParams, SurfaceDetachedParams, ViewEventParams,
 };
-use atelyx_plugin_sdk::protocol::view::{EventValue, ViewEvent};
-use atelyx_plugin_sdk::{run_stdio, Context, PluginHandler, PluginInfo};
+use atelyx_plugin_sdk::protocol::view::{EventValue, ViewEvent, ViewNode};
+use atelyx_plugin_sdk::{run_stdio, view_builders, Context, PluginHandler, PluginInfo};
 use tokio::sync::Mutex;
 
 mod config;
@@ -213,17 +213,24 @@ impl AppState {
 struct TableForm {
     state: Arc<Mutex<AppState>>,
     provider: Arc<tokio::sync::OnceCell<Provider>>,
+    /// 最近一次建好的树：渲染持状态锁时更新，托管循环的构建器同步取用。
+    tree: Arc<std::sync::Mutex<Option<ViewNode>>>,
 }
 
 impl TableForm {
     fn new() -> Self {
-        Self { state: Arc::new(Mutex::new(AppState::default())), provider: Arc::new(tokio::sync::OnceCell::new()) }
+        Self {
+            state: Arc::new(Mutex::new(AppState::default())),
+            provider: Arc::new(tokio::sync::OnceCell::new()),
+            tree: Arc::new(std::sync::Mutex::new(None)),
+        }
     }
 
     /// 停手后写回待写格子：旧任务醒来发现序号已被后来的按键推进，就交给最新那次收尾。
     fn schedule_flush(&self, ctx: &Context, epoch: u64) {
         let state = self.state.clone();
         let provider = self.provider.clone();
+        let tree = self.tree.clone();
         let ctx = ctx.clone();
         tokio::spawn(async move {
             tokio::time::sleep(FLUSH_DEBOUNCE).await;
@@ -233,7 +240,7 @@ impl TableForm {
             }
             st.flush_scheduled = false;
             report(&ctx, settle(provider.get(), &mut st, false).await).await;
-            render(&ctx, &mut st).await;
+            render(&ctx, &mut st, &tree).await;
         });
     }
 }
@@ -241,6 +248,16 @@ impl TableForm {
 #[async_trait::async_trait]
 impl PluginHandler for TableForm {
     async fn on_ready(&self, ctx: &Context) {
+        // 先挂构建器：`host:surface.attached` 与 ready 并发到达，回调里的提交要到落位
+        let tree = Arc::clone(&self.tree);
+        ctx.ui()
+            .mount(SURFACE, move || {
+                tree.lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| view_builders::column("root", Vec::new()))
+            })
+            .await;
         if let Err(e) = ctx.subscribe(event::name::TABLE_CHANGED).await {
             eprintln!("订阅表格变更失败：{e}");
             notify(ctx, "订阅表格变更失败，界面不会随表格自动刷新", NotificationLevel::Warning).await;
@@ -253,7 +270,7 @@ impl PluginHandler for TableForm {
         let mut st = self.state.lock().await;
         st.config = load_config(ctx).await;
         report(ctx, settle(self.provider.get(), &mut st, true).await).await;
-        render(ctx, &mut st).await;
+        render(ctx, &mut st, &self.tree).await;
     }
 
     async fn on_surface_attached(&self, ctx: &Context, params: SurfaceAttachedParams) {
@@ -271,7 +288,7 @@ impl PluginHandler for TableForm {
         }
         // 挂载即一次全新投影：以宿主当前打开的表格为准
         report(ctx, settle(self.provider.get(), &mut st, true).await).await;
-        render(ctx, &mut st).await;
+        render(ctx, &mut st, &self.tree).await;
     }
 
     async fn on_surface_detached(&self, ctx: &Context, params: SurfaceDetachedParams) {
@@ -308,7 +325,7 @@ impl PluginHandler for TableForm {
             TableChange::Switched { dropped: false } | TableChange::Reload => {}
         }
         report(ctx, settle(self.provider.get(), &mut st, true).await).await;
-        render(ctx, &mut st).await;
+        render(ctx, &mut st, &self.tree).await;
     }
 
     async fn on_view_event(&self, ctx: &Context, params: ViewEventParams) {
@@ -418,14 +435,14 @@ impl PluginHandler for TableForm {
                 persist_config(ctx, &st).await;
             }
         }
-        render(ctx, &mut st).await;
+        render(ctx, &mut st, &self.tree).await;
     }
 }
 
 // ---------- 渲染 ----------
 
 /// 由当前状态建树并整树提交；持锁调用，确保「最后落地的树 = 最终状态」。
-async fn render(ctx: &Context, st: &mut AppState) {
+async fn render(ctx: &Context, st: &mut AppState, tree_slot: &std::sync::Mutex<Option<ViewNode>>) {
     if !st.mounted {
         return;
     }
@@ -443,7 +460,8 @@ async fn render(ctx: &Context, st: &mut AppState) {
         image: &st.image,
     });
     st.actions = actions;
-    match ctx.submit_view(SURFACE, tree).await {
+    *tree_slot.lock().unwrap() = Some(tree);
+    match ctx.ui().notify(SURFACE).await {
         Ok(_) => st.submit_failing = false,
         // 提交被拒 = 界面停在旧树上，用户看不出差别，转成失败时通知一次
         Err(e) => {
