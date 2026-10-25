@@ -129,7 +129,7 @@ mod tests {
             Field { id: "b".into(), name: "B".into(), kind: FieldType::Number, options: vec![] },
             Field { id: "c".into(), name: "C".into(), kind: FieldType::SingleSelect, options: vec!["x".into()] },
         ];
-        TableSnapshot { path: "任务.atb".into(), fields, rows: vec![Row { id: "r1".into(), cells: Map::new() }] }
+        TableSnapshot { path: "任务.atb".into(), fields, rows: vec![Row { id: "r1".into(), cells: Map::new() }], ..Default::default() }
     }
 
     #[test]

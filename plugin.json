@@ -7,7 +7,7 @@
     "windows": "table-form.exe",
     "linux": "table-form"
   },
-  "permissions": ["state", "notification", "table"],
+  "permissions": ["state", "notification", "table", "vault", "dialog"],
   "singleton": true,
   "keepMountedOnVaultSwitch": false
 }

@@ -27,6 +27,8 @@ pub enum Action {
     AddRow,
     Refresh,
     ToggleSettings,
+    /// 删除当前行（宿主有撤销栈兜底）。
+    RemoveRow,
     /// 文本 / 时长 / 数字 / 下拉格写入：具体读法由字段的类型在入口决定。
     SetCell { field: String },
     /// 单选按钮样式里点中某个选项：`index` 是界面渲染出的选项下标。
@@ -35,12 +37,14 @@ pub enum Action {
     ClearSelect { field: String },
     /// 图片：移除这一张（其余引用与该格显示模式保留）。
     RemoveImage { field: String, path: String },
-    /// 图片：点缩略图，把主图切到这一张。
-    ShowImage { field: String, path: String },
-    /// 图片：点主图，进入面板内大图预览。
-    OpenImage { field: String },
+    /// 图片：选一张本机图片导入仓库并追加进这一格。
+    AddImage { field: String },
+    /// 图片：点缩略图，进灯箱看这一张。
+    OpenImage { field: String, path: String },
     /// 预览：翻到相邻那张（`delta` = ±1，首尾相接）。
     ImageStep { delta: isize },
+    /// 预览浮层聚焦后的按键：左右翻张、Esc 关闭，具体键由入口解码。
+    ImageKey,
     /// 预览：退出，回到表单。
     CloseImage,
     /// 设置：字段显示 / 隐藏切换。
@@ -53,16 +57,14 @@ pub enum Action {
     ToggleRadio { field: String },
 }
 
-/// 图片格的界面焦点：主图停在哪一张、是否在看大图预览。
+/// 图片格的界面焦点：是否在看大图预览。
 ///
-/// 焦点按「行 id + 字段 id + 图片引用」锚定而不是按序号：翻行、换表、那张图被删都要把它清掉，
-/// 否则界面会停在越界位置上；协作者在同一格里增删图片时，序号会漂到另一张上，引用不会。
+/// 预览按「行 id + 字段 id + 图片引用」锚定而不是按序号：翻行、换表、那张图被删都要把它清掉，
+/// 否则预览会停在失效的引用上；协作者在同一格里增删图片时，序号会漂，引用不会。
 #[derive(Clone, Debug, Default)]
 pub struct ImageFocus {
-    /// 焦点属于哪一行；与当前行不符就整批作废。
+    /// 预览属于哪一行；与当前行不符就作废。
     pub row: Option<String>,
-    /// 字段 id → 该格主图当前那张的引用。
-    pub cursors: HashMap<String, String>,
     /// 大图预览指向的那张；`None` = 表单态。
     pub preview: Option<Preview>,
 }
@@ -75,30 +77,12 @@ pub struct Preview {
 }
 
 impl ImageFocus {
-    /// 主图序号：焦点不属于这一行、或这一格已经没有那张引用，都回第 0 张。
-    pub fn cursor(&self, row_id: &str, field: &str, paths: &[String]) -> usize {
-        if self.row.as_deref() != Some(row_id) {
-            return 0;
-        }
-        self.cursors
-            .get(field)
-            .and_then(|path| paths.iter().position(|item| item == path))
-            .unwrap_or_default()
-    }
-
-    /// 把某字段的主图切到这一张；行换了先作废旧焦点，免得旧引用用到新行上。
-    pub fn focus(&mut self, row_id: &str, field: &str, path: &str) {
+    /// 打开大图预览；行换了先作废旧预览，免得旧引用落到新行上。
+    pub fn open(&mut self, row_id: &str, field: &str, path: &str) {
         if self.row.as_deref() != Some(row_id) {
             self.row = Some(row_id.to_string());
-            self.cursors.clear();
             self.preview = None;
         }
-        self.cursors.insert(field.to_string(), path.to_string());
-    }
-
-    /// 打开大图预览：主图先落到这一张（退出预览后显示的就是它），再进入预览态。
-    pub fn open(&mut self, row_id: &str, field: &str, path: &str) {
-        self.focus(row_id, field, path);
         self.preview = Some(Preview { field: field.to_string(), path: path.to_string() });
     }
 }
@@ -114,31 +98,28 @@ pub struct FormView<'a> {
     pub image: &'a ImageFocus,
 }
 
-/// 主图边长（正方形）、缩略图边长与图条高度、方块间隙。
-const MAIN_IMAGE: f32 = 112.0;
+/// 缩略图边长与图条高度、方块间隙；预览大图定高（铺满可用宽，四周由浮层边距留白）。
 const THUMB_IMAGE: f32 = 40.0;
 const THUMB_STRIP: f32 = 64.0;
 const IMAGE_GAP: f32 = 4.0;
-/// 预览大图的高度：面板内预览没有全屏，给一个够看清又不出屏的定高，超出由外层滚动承接。
-const PREVIEW_HEIGHT: f32 = 420.0;
-
+const PREVIEW_HEIGHT: f32 = 480.0;
 /// 构建整棵界面树，并返回「节点 id → 动作」映射。
+/// 大图预览是根列上的一层面内浮层：树里出现即打开，遮罩拦下下层交互，表单本身保持原样。
 pub fn build(view: &FormView) -> (ViewNode, HashMap<String, Action>) {
     let mut actions: HashMap<String, Action> = HashMap::new();
-    let preview = preview_target(view);
-    let mut top: Vec<ViewNode> = vec![match &preview {
-        Some(target) => preview_header(target),
-        None => header(view, &mut actions),
-    }];
+    let mut top: Vec<ViewNode> = vec![header(view, &mut actions)];
     if let Some(status) = view.status {
         top.push(muted_sized("status", status.to_string(), 0.9));
     }
-    top.push(match preview {
-        Some(target) => preview_body(&target, &mut actions),
-        None if view.show_settings => settings(view, &mut actions),
-        None => form_body(view, &mut actions),
+    top.push(match view.show_settings {
+        true => settings(view, &mut actions),
+        false => form_body(view, &mut actions),
     });
-    (column("root", 12.0, top), actions)
+    let mut root = column("root", 12.0, top);
+    if let Some(target) = preview_target(view) {
+        root.children.push(preview_overlay(&target, &mut actions));
+    }
+    (root, actions)
 }
 
 /// 预览目标：字段不是图片列、当前行没有那张图、这一格已经不含那条引用，都回 `None`
@@ -152,12 +133,11 @@ fn preview_target(view: &FormView) -> Option<PreviewTarget> {
     let field = view.snapshot.fields.iter().find(|field| field.id == preview.field && field.kind == FieldType::Image)?;
     let paths = record.cell(field).images().to_vec();
     let index = paths.iter().position(|path| path == &preview.path)?;
-    Some(PreviewTarget { field_name: field.name.clone(), paths, index })
+    Some(PreviewTarget { paths, index })
 }
 
-/// 预览态要画的那一张：字段名（写标题）、该格全部路径（算翻张范围）与当前序号。
+/// 预览态要画的那一张：该格全部路径（算翻张范围）与当前序号。
 struct PreviewTarget {
-    field_name: String,
     paths: Vec<String>,
     index: usize,
 }
@@ -210,6 +190,7 @@ fn header(view: &FormView, actions: &mut HashMap<String, Action>) -> ViewNode {
                 actions,
             ),
             label_button_sized("hdr-add", "新增行", ButtonVariant::Primary, open, ControlSize::Md, Action::AddRow, actions),
+            icon_sized("hdr-remove", "trash-2", "删除当前行", has_row, ControlSize::Md, Action::RemoveRow, actions),
             icon_sized("hdr-refresh", "refresh-cw", "刷新", true, ControlSize::Md, Action::Refresh, actions),
             icon_sized("hdr-settings", "settings", "设置", open, ControlSize::Md, Action::ToggleSettings, actions),
         ],
@@ -334,7 +315,7 @@ fn control(
         FieldType::Duration => editable(input(&format!("ctl-{slot}"), value.as_edit_text(), "如 1:30:00"), key, actions),
         FieldType::Number => editable(number_node(&format!("ctl-{slot}"), value.as_number(), "请输入"), key, actions),
         FieldType::SingleSelect => select_control(view, record, slot, field, actions),
-        FieldType::Image => image_control(view, record, slot, field, actions),
+        FieldType::Image => image_control(record, slot, field, actions),
         // 宿主未列举（或将来新增）的类型：只读显示原值，不登记写入口
         FieldType::Other(_) => plain(&format!("ctl-{slot}"), value.as_edit_text()),
     }
@@ -416,10 +397,8 @@ fn select_control(
     }
 }
 
-/// 图片格：上方居中的主图（悬停右上角浮现移除钮），下方是横向缩略图条。
-/// 点主图进面板内预览态看大图；宿主没给插件开全屏灯箱出口，预览只能收在面板里。
+/// 图片格：一条横向缩略图（末尾一枚「添加图片」钮，空格子只给添加钮）。点缩略图进灯箱看大图。
 fn image_control(
-    view: &FormView,
     record: &Row,
     slot: usize,
     field: &crate::model::Field,
@@ -428,40 +407,54 @@ fn image_control(
     let key = field.id.as_str();
     let paths = record.cell(field).images().to_vec();
     if paths.is_empty() {
+        // 空格不画图区，直接给一枚添加钮
         return row(
             &format!("ctl-{slot}"),
             8.0,
             None,
             Some(Align::Center),
             None,
-            vec![muted(&format!("img-none-{slot}"), "暂无图片")],
+            vec![label_button_sized(
+                &format!("img-add-{slot}"),
+                "添加图片",
+                ButtonVariant::Ghost,
+                true,
+                ControlSize::Md,
+                Action::AddImage { field: key.to_string() },
+                actions,
+            )],
         );
     }
-    let current = view.image.cursor(&record.id, key, &paths);
-    column(
-        &format!("ctl-{slot}"),
-        8.0,
-        vec![
-            main_image(slot, key, current, &paths[current], actions),
-            text_aligned(&format!("img-count-{slot}"), format!("第 {} / {} 张", current + 1, paths.len()), 0.85, None, Some(ColorToken::TextMuted), Align::Center),
-            thumb_strip(slot, key, current, &paths, actions),
-        ],
-    )
+    let mut tiles: Vec<ViewNode> = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| thumb_tile(slot, key, index, path, actions))
+        .collect();
+    tiles.push(label_button_sized(
+        &format!("img-add-{slot}"),
+        "添加",
+        ButtonVariant::Ghost,
+        true,
+        ControlSize::Md,
+        Action::AddImage { field: key.to_string() },
+        actions,
+    ));
+    strip(&format!("img-strip-{slot}"), THUMB_STRIP, IMAGE_GAP, tiles)
 }
 
-/// 主图：定正方图 + 叠在右上角的悬停移除钮。
+/// 缩略图方块：点开灯箱看这张，悬停右上角浮现移除钮。
 ///
-/// 叠层的尺寸由**第一个**子节点决定，其后的子节点被压进同一个方框里左上角对齐，所以底图必须
-/// 先提交、右上角标只能是它的兄弟节点：那列宽度铺满叠层、高度按自身内容收缩，右对齐后角标正好贴右上角。
-fn main_image(slot: usize, field: &str, index: usize, path: &str, actions: &mut HashMap<String, Action>) -> ViewNode {
-    let base = match vault_source(path) {
+/// 叠层的尺寸由**第一个**子节点决定，其后的子节点被压进同一个方框里：底图是定方，
+/// 角标列铺满同一方框后右对齐，移除钮正好贴右上角。
+fn thumb_tile(slot: usize, field: &str, index: usize, path: &str, actions: &mut HashMap<String, Action>) -> ViewNode {
+    let base = match image_source(path) {
         Some(source) => bind_click(
-            image_node(&format!("img-{slot}-{index}"), source, ImageFit::Cover, SizeSpec::Fixed(MAIN_IMAGE), SizeSpec::Fixed(MAIN_IMAGE)),
-            Action::OpenImage { field: field.to_string() },
+            image_node(&format!("img-th-{slot}-{index}"), source, ImageFit::Cover, SizeSpec::Fixed(THUMB_IMAGE), SizeSpec::Fixed(THUMB_IMAGE)),
+            Action::OpenImage { field: field.to_string(), path: path.to_string() },
             actions,
         ),
-        // 读不到仓库内容的路径（外链、绝对路径、越界段）保留原文，至少能看出引用了什么
-        None => plain(&format!("img-{slot}-{index}"), path.to_string()),
+        // 读不到内容的引用保留原文，至少能看出引用了什么
+        None => plain(&format!("img-th-{slot}-{index}"), path.to_string()),
     };
     let remove = hover_icon_sized(
         &format!("img-rm-{slot}-{index}"),
@@ -471,87 +464,124 @@ fn main_image(slot: usize, field: &str, index: usize, path: &str, actions: &mut 
         Action::RemoveImage { field: field.to_string(), path: path.to_string() },
         actions,
     );
-    let corner = column_aligned(&format!("img-rm-wrap-{slot}"), 0.0, Some(Align::End), vec![remove]);
-    let stack = node(&format!("img-main-{slot}"), NodeBody::Stack {}).with_children(vec![base, corner]);
-    column_aligned(&format!("img-center-{slot}"), 0.0, Some(Align::Center), vec![stack])
+    let corner = column_aligned(&format!("img-rm-wrap-{slot}-{index}"), 0.0, Some(Align::End), vec![remove]);
+    let tile = node(&format!("img-tile-{slot}-{index}"), NodeBody::Stack {}).with_children(vec![base, corner]);
+    thumb_card(&format!("img-card-{slot}-{index}"), vec![tile])
 }
 
-/// 缩略图条：横向滚动的方卡列表，选中那张描边。
-fn thumb_strip(slot: usize, field: &str, current: usize, paths: &[String], actions: &mut HashMap<String, Action>) -> ViewNode {
-    let tiles: Vec<ViewNode> = paths
-        .iter()
-        .enumerate()
-        .map(|(index, path)| thumb_tile(slot, field, index, index == current, path, actions))
-        .collect();
-    strip(&format!("img-strip-{slot}"), THUMB_STRIP, IMAGE_GAP, tiles)
-}
-
-fn thumb_tile(
-    slot: usize,
-    field: &str,
-    index: usize,
-    selected: bool,
-    path: &str,
-    actions: &mut HashMap<String, Action>,
-) -> ViewNode {
-    let visual = match vault_source(path) {
-        Some(source) => bind_click(
-            image_node(&format!("img-th-{slot}-{index}"), source, ImageFit::Cover, SizeSpec::Fixed(THUMB_IMAGE), SizeSpec::Fixed(THUMB_IMAGE)),
-            Action::ShowImage { field: field.to_string(), path: path.to_string() },
-            actions,
-        ),
-        None => plain(&format!("img-th-{slot}-{index}"), path.to_string()),
-    };
-    thumb_card(&format!("img-tile-{slot}-{index}"), selected, vec![visual])
-}
-
-/// 预览态头部：只留标题与字段名，翻行/写值操作在这里没有意义。
-fn preview_header(target: &PreviewTarget) -> ViewNode {
-    let info = column(
-        "hdr-info",
-        2.0,
-        vec![
-            text_sized("hdr-title", "图片预览", 1.15, Some(TextWeight::SemiBold), None),
-            muted_sized("hdr-pos", target.field_name.clone(), 0.9),
-        ],
-    );
-    toolbar_card(row("hdr", 12.0, Some(SizeSpec::Fill), Some(Align::Center), None, vec![info]))
-}
-
-/// 预览体：大图 + 一排「上一张 / 第 N / M 张 / 下一张 / 关闭」。
-/// 界面树收不到按键，Esc 与左右键退出靠这排钮。
-fn preview_body(target: &PreviewTarget, actions: &mut HashMap<String, Action>) -> ViewNode {
+/// 预览浮层：形式与宿主表格的图片灯箱一致——整面遮罩上一张 Contain 大图，点图片外任意处
+/// 收起，没有关闭钮；多张时翻张钮贴左右缘居中、「N / M」贴底居中。图片节点声明 `key`：
+/// 点图片取得键盘焦点，随后左右键翻张、Esc 关闭——落在图片身上的按下被图片节点截住
+/// （取焦点的手势），不会落到底层收起热区，点图才不会误关。
+fn preview_overlay(target: &PreviewTarget, actions: &mut HashMap<String, Action>) -> ViewNode {
     let count = target.paths.len();
     let path = &target.paths[target.index];
-    let visual = match vault_source(path) {
-        Some(source) => image_node("pv-image", source, ImageFit::Contain, SizeSpec::Fill, SizeSpec::Fixed(PREVIEW_HEIGHT)),
-        None => text_aligned("pv-image", format!("这张图片无法读取：{path}"), 1.0, None, Some(ColorToken::TextMuted), Align::Center),
-    };
-    let frame = card_tone("pv-frame", CardTone::Muted, 10.0, 8.0, vec![visual]);
-    let bar = row(
-        "pv-bar",
-        8.0,
-        Some(SizeSpec::Fill),
-        Some(Align::Center),
-        Some(Justify::Center),
-        vec![
-            icon_sized("pv-prev", "chevron-left", "上一张", count > 1, ControlSize::Md, Action::ImageStep { delta: -1 }, actions),
-            muted_sized("pv-count", format!("第 {} / {} 张", target.index + 1, count), 0.9),
-            icon_sized("pv-next", "chevron-right", "下一张", count > 1, ControlSize::Md, Action::ImageStep { delta: 1 }, actions),
-            icon_sized("pv-close", "x", "关闭预览", true, ControlSize::Md, Action::CloseImage, actions),
-        ],
-    );
-    scroll("pv", vec![column("pv-col", 10.0, vec![frame, bar])])
+    let mut parts: Vec<ViewNode> = vec![{
+        // 底层收起热区：铺满整面，图片外的按下都落到这里
+        let mut catcher = fill_layer("pv-catcher");
+        catcher.events = vec![EventKind::Click];
+        actions.insert(catcher.id.clone(), Action::CloseImage);
+        catcher
+    }];
+    parts.push(preview_center(match image_source(path) {
+        Some(source) => {
+            let mut image = image_node("pv-image", source, ImageFit::Contain, SizeSpec::Fill, SizeSpec::Fixed(PREVIEW_HEIGHT));
+            image.events = vec![EventKind::Key];
+            actions.insert(image.id.clone(), Action::ImageKey);
+            image
+        }
+        None => muted("pv-image", format!("这张图片无法读取：{path}")),
+    }));
+    if count > 1 {
+        parts.push(overlay_slot(
+            "pv-prev-wrap",
+            Some(Align::Center),
+            None,
+            icon_sized("pv-prev", "chevron-left", "上一张", true, ControlSize::Md, Action::ImageStep { delta: -1 }, actions),
+        ));
+        parts.push(overlay_slot(
+            "pv-next-wrap",
+            Some(Align::Center),
+            Some(Justify::End),
+            icon_sized("pv-next", "chevron-right", "下一张", true, ControlSize::Md, Action::ImageStep { delta: 1 }, actions),
+        ));
+        parts.push(overlay_slot(
+            "pv-count-wrap",
+            Some(Align::End),
+            Some(Justify::Center),
+            text_sized("pv-count", format!("{}/{}", target.index + 1, count), 0.9, None, Some(ColorToken::Text)),
+        ));
+    }
+    node("pv-overlay", NodeBody::Overlay { scrim: None })
+        .with_children(vec![node("pv-view", NodeBody::Stack {}).with_children(parts)])
 }
 
-/// 只把仓库内相对路径交给宿主取图：外链、绝对路径与 `..` 段不作为仓库内容读。
-fn vault_source(path: &str) -> Option<ImageSource> {
-    let rejected = path.trim().is_empty()
-        || path.contains(':')
-        || path.starts_with('/')
-        || path.starts_with('\\')
-        || path.split(['/', '\\']).any(|segment| segment == "..");
-    (!rejected).then(|| ImageSource::Vault { path: path.to_string() })
+/// 灯箱贴边槽：高度铺满浮层、宽度随内容的行，把单个子项摆到指定角落。
+/// 宽度不能声明 Fill：撑满的行自己就是整行，外层容器的 justify 对齐会失效（宿主 Row 同款规则）。
+fn overlay_slot(id: &str, cross_align: Option<Align>, justify: Option<Justify>, child: ViewNode) -> ViewNode {
+    node(
+        id,
+        NodeBody::Row {
+            gap: None,
+            padding: Some(PaddingSpec::All(8.0)),
+            justify,
+            cross_align,
+            size: Some(BoxSize { height: Some(SizeSpec::Fill), ..BoxSize::default() }),
+        },
+    )
+    .with_children(vec![child])
+}
+
+/// 灯箱中图槽：铺满整面的行，图片带四周遮罩边距、垂直水平居中。
+fn preview_center(child: ViewNode) -> ViewNode {
+    node(
+        "pv-center",
+        NodeBody::Row {
+            gap: None,
+            padding: Some(PaddingSpec::All(24.0)),
+            justify: Some(Justify::Center),
+            cross_align: Some(Align::Center),
+            size: Some(BoxSize { width: Some(SizeSpec::Fill), height: Some(SizeSpec::Fill), ..BoxSize::default() }),
+        },
+    )
+    .with_children(vec![child])
+}
+
+/// 铺满父容器的空白行：浮层里当收起热区（整面底层）。
+fn fill_layer(id: &str) -> ViewNode {
+    node(
+        id,
+        NodeBody::Row {
+            gap: None,
+            padding: None,
+            justify: None,
+            cross_align: None,
+            size: Some(BoxSize { width: Some(SizeSpec::Fill), height: Some(SizeSpec::Fill), ..BoxSize::default() }),
+        },
+    )
+}
+
+/// 图片引用 → 图源：http(s) 外链走远程图，本机绝对路径（盘符 / UNC / 根相对）走文件源，
+/// 其余按仓库相对路径读仓库；空串、含 `..` 的越界段与其他协议（`data:` 等）回 `None`，
+/// 界面保留纯文本，至少看得出引用了什么。
+fn image_source(path: &str) -> Option<ImageSource> {
+    let path = path.trim();
+    if path.is_empty() || path.split(['/', '\\']).any(|segment| segment == "..") {
+        return None;
+    }
+    let lower = path.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Some(ImageSource::Url { url: path.to_string(), local: None });
+    }
+    let bytes = path.as_bytes();
+    let absolute = lower.starts_with('/')
+        || bytes.first() == Some(&b'\\')
+        || (bytes.get(1) == Some(&b':') && matches!(bytes.get(2), Some(b'\\') | Some(b'/')));
+    if absolute {
+        return Some(ImageSource::File { path: path.to_string() });
+    }
+    // 剩余的带冒号片段是别的协议、不是仓库路径；不猜它的读法
+    (bytes.first() != Some(&b':') && !path.contains(':')).then(|| ImageSource::Vault { path: path.to_string() })
 }
 
 fn image_node(id: &str, source: ImageSource, fit: ImageFit, width: SizeSpec, height: SizeSpec) -> ViewNode {
@@ -692,12 +722,12 @@ fn row(
 }
 
 fn scroll(id: &str, children: Vec<ViewNode>) -> ViewNode {
-    node(id, NodeBody::Scroll { direction: None, gap: None, height: None }).with_children(children)
+    node(id, NodeBody::Scroll { direction: None, gap: None, height: None, follow_end: None }).with_children(children)
 }
 
 /// 横向图条：固定高度、内容按自身宽度溢出（宿主对横向滚动按 `height` 做图条）。
 fn strip(id: &str, height: f32, gap: f32, children: Vec<ViewNode>) -> ViewNode {
-    node(id, NodeBody::Scroll { direction: Some(Axis::Horizontal), gap: Some(gap), height: Some(height) }).with_children(children)
+    node(id, NodeBody::Scroll { direction: Some(Axis::Horizontal), gap: Some(gap), height: Some(height), follow_end: None }).with_children(children)
 }
 
 fn card(id: &str, children: Vec<ViewNode>) -> ViewNode {
@@ -721,14 +751,14 @@ fn card_tone(id: &str, tone: CardTone, radius: f32, padding: f32, children: Vec<
     .with_children(children)
 }
 
-/// 缩略图方卡：按内容收缩，选中那张描 accent 边（宿主卡片自带主题色，插件不写死色值）。
-fn thumb_card(id: &str, selected: bool, children: Vec<ViewNode>) -> ViewNode {
+/// 缩略图方卡：按内容收缩（宿主卡片自带主题色，插件不写死色值）。
+fn thumb_card(id: &str, children: Vec<ViewNode>) -> ViewNode {
     node(
         id,
         NodeBody::Card {
             gap: None,
             padding: Some(PaddingSpec::All(2.0)),
-            accent: Some(selected),
+            accent: None,
             tone: Some(CardTone::Muted),
             radius: Some(6.0),
             bordered: Some(true),
@@ -760,6 +790,7 @@ fn text_sized(
             align: None,
             family: None,
             wrap: None,
+            max_lines: None,
         },
     )
 }
@@ -782,6 +813,7 @@ fn text_aligned(
             align: Some(align),
             family: None,
             wrap: None,
+            max_lines: None,
         },
     )
 }
@@ -811,7 +843,8 @@ fn input(id: &str, value: impl Into<String>, placeholder: &str) -> ViewNode {
 fn number_node(id: &str, value: Option<f64>, placeholder: &str) -> ViewNode {
     node(
         id,
-        NodeBody::NumberInput { value, min: None, max: None, step: None, placeholder: Some(placeholder.to_string()), read_only: None, report: None },
+        // 步进 1：宿主在输入框右侧渲染上下步进按钮，微调比敲键盘顺手
+        NodeBody::NumberInput { value, min: None, max: None, step: Some(1.0), placeholder: Some(placeholder.to_string()), read_only: None, report: None },
     )
 }
 
@@ -914,7 +947,7 @@ mod tests {
         cells.insert("i".to_string(), CellValue::Images(ImageCell { paths, ..ImageCell::default() }));
         cells.insert("u".to_string(), CellValue::Foreign(json!(12)));
         let row = Row { id: "r1".to_string(), cells };
-        TableSnapshot { path: "任务/看板.atb".to_string(), fields, rows: vec![row] }
+        TableSnapshot { path: "任务/看板.atb".to_string(), fields, rows: vec![row], ..Default::default() }
     }
 
     fn build_with(snapshot: &TableSnapshot, settings: bool) -> (ViewNode, HashMap<String, Action>) {
@@ -926,18 +959,11 @@ mod tests {
         build(&FormView { snapshot, config: &TableFormConfig::default(), row_index: 0, show_settings: settings, status: None, image })
     }
 
-    /// 主图停在 `path` 那一张的界面（图片字段固定为 `i`）。
-    fn focused(snapshot: &TableSnapshot, path: &str) -> ImageFocus {
-        ImageFocus { row: Some(snapshot.rows[0].id.clone()), cursors: [("i".to_string(), path.to_string())].into(), preview: None }
-    }
-
-    /// 正在预览 `path` 那一张的界面。
+    /// 正在预览 `path` 那一张的界面（图片字段固定为 `i`）。
     fn previewing(snapshot: &TableSnapshot, path: &str) -> ImageFocus {
-        ImageFocus {
-            row: Some(snapshot.rows[0].id.clone()),
-            cursors: [("i".to_string(), path.to_string())].into(),
-            preview: Some(Preview { field: "i".to_string(), path: path.to_string() }),
-        }
+        let mut focus = ImageFocus::default();
+        focus.open(&snapshot.rows[0].id, "i", path);
+        focus
     }
 
     /// 界面里的节点 id 带的是字段在本次投影里的序号；测试按同一算法取名，不写死序号。
@@ -1009,6 +1035,7 @@ mod tests {
             path: "撞名.atb".into(),
             fields,
             rows: vec![Row { id: "r".into(), cells: BTreeMap::new() }],
+            ..Default::default()
         };
         let mut config = TableFormConfig::default();
         config.set_radio("a", true);
@@ -1018,7 +1045,7 @@ mod tests {
     }
 
     #[test]
-    fn thumbs_select_their_own_image_and_only_the_shown_one_can_be_removed() {
+    fn thumbs_open_their_own_image_and_each_can_be_removed() {
         let snapshot = snapshot_with(&["assets/a.png", "assets/b.png"]);
         let config = TableFormConfig::default();
         let (tree, actions) = build_with(&snapshot, false);
@@ -1027,37 +1054,16 @@ mod tests {
             let id = format!("img-th-{slot}-{index}");
             assert_eq!(
                 actions.get(&id),
-                Some(&Action::ShowImage { field: "i".to_string(), path: path.to_string() }),
-                "每张缩略图应切到它自己那一张"
+                Some(&Action::OpenImage { field: "i".to_string(), path: path.to_string() }),
+                "每张缩略图应打开它自己那一张的灯箱"
             );
             assert!(tree.find(&id).is_some());
+            assert_eq!(
+                actions.get(&format!("img-rm-{slot}-{index}")),
+                Some(&Action::RemoveImage { field: "i".to_string(), path: path.to_string() }),
+                "每张缩略图都带移除钮"
+            );
         }
-        // 移除钮只挂在主图上：删掉的就是当前显示的那一张
-        assert_eq!(actions.get(&format!("img-{slot}-0")), Some(&Action::OpenImage { field: "i".to_string() }));
-        assert_eq!(actions.get(&format!("img-rm-{slot}-0")), Some(&Action::RemoveImage { field: "i".to_string(), path: "assets/a.png".to_string() }));
-        assert!(tree.find(&format!("img-rm-{slot}-1")).is_none(), "没显示的那张不该有移除钮");
-    }
-
-    #[test]
-    fn focused_image_moves_the_main_tile_and_the_remove_target() {
-        let snapshot = snapshot_with(&["assets/a.png", "assets/b.png"]);
-        let config = TableFormConfig::default();
-        let (tree, actions) = build_view(&snapshot, false, &focused(&snapshot, "assets/b.png"));
-        let slot = slot_of(&snapshot, &config, "i");
-        assert!(tree.find(&format!("img-{slot}-1")).is_some(), "主图应换成焦点那一张");
-        assert_eq!(actions.get(&format!("img-rm-{slot}-1")), Some(&Action::RemoveImage { field: "i".to_string(), path: "assets/b.png".to_string() }));
-        assert_eq!(text_of(&tree, &format!("img-count-{slot}")).as_deref(), Some("第 2 / 2 张"));
-    }
-
-    #[test]
-    fn a_focus_on_a_gone_reference_falls_back_to_the_first_image() {
-        // 那张被协作者删掉了：界面回退到第一张，不画一块空位
-        let snapshot = snapshot_with(&["assets/a.png"]);
-        let config = TableFormConfig::default();
-        let (tree, _) = build_view(&snapshot, false, &focused(&snapshot, "assets/gone.png"));
-        let slot = slot_of(&snapshot, &config, "i");
-        assert!(tree.find(&format!("img-{slot}-0")).is_some());
-        assert!(tree.find(&format!("img-th-{slot}-1")).is_none(), "这一格只剩一张，不该有第二张");
     }
 
     #[test]
@@ -1069,22 +1075,21 @@ mod tests {
         let NodeBody::IconButton { hover_only, .. } = &tree.find(&format!("img-rm-{slot}-0")).expect("移除钮应在树里").body else {
             panic!("移除钮应是图标钮");
         };
-        assert_eq!(*hover_only, Some(true), "常驻角标会把图片本身盖掉");
+        assert_eq!(*hover_only, Some(true), "常驻角标会把缩略图本身盖掉");
     }
 
     #[test]
-    fn main_image_is_the_base_under_the_remove_badge() {
+    fn thumb_badge_sits_on_its_own_image() {
         let snapshot = snapshot_with(&["assets/a.png"]);
         let config = TableFormConfig::default();
         let (tree, actions) = build_with(&snapshot, false);
         let slot = slot_of(&snapshot, &config, "i");
-        let stack = tree.find(&format!("img-main-{slot}")).expect("主图叠层应在树里");
-        // 叠层尺寸由第一个子节点决定：底图必须排在角标之前，否则整块塌成按钮那么大
+        let stack = tree.find(&format!("img-tile-{slot}-0")).expect("缩略图叠层应在树里");
+        // 叠层尺寸由第一个子节点决定：底图在前、角标列在后
         assert_eq!(stack.children.len(), 2);
         assert!(matches!(stack.children[0].body, NodeBody::Image { .. }));
         assert!(matches!(stack.children[1].body, NodeBody::Column { .. }));
-        // 底图点下去进预览，角标只登记移除
-        assert_eq!(actions.get(&format!("img-{slot}-0")), Some(&Action::OpenImage { field: "i".to_string() }));
+        assert_eq!(actions.get(&format!("img-th-{slot}-0")), Some(&Action::OpenImage { field: "i".to_string(), path: "assets/a.png".to_string() }));
         assert_eq!(actions.get(&format!("img-rm-{slot}-0")), Some(&Action::RemoveImage { field: "i".to_string(), path: "assets/a.png".to_string() }));
     }
 
@@ -1100,8 +1105,8 @@ mod tests {
         };
         assert_eq!(*direction, Some(Axis::Horizontal));
         assert_eq!(*height, Some(THUMB_STRIP));
-        // 条里只有缩略图方块，一格两张就有两个
-        assert_eq!(rail.children.len(), 2);
+        // 条里是缩略图方块加末尾一枚添加钮
+        assert_eq!(rail.children.len(), 3);
     }
 
     #[test]
@@ -1115,11 +1120,22 @@ mod tests {
         assert_eq!(source, &ImageSource::Vault { path: "assets/b.png".to_string() });
         assert_eq!(fit, &Some(ImageFit::Contain));
         assert_eq!((*width, *height), (Some(SizeSpec::Fill), Some(SizeSpec::Fixed(PREVIEW_HEIGHT))));
-        assert_eq!(text_of(&tree, "pv-count").as_deref(), Some("第 2 / 3 张"));
+        assert_eq!(text_of(&tree, "pv-count").as_deref(), Some("2/3"));
         assert_eq!(actions.get("pv-prev"), Some(&Action::ImageStep { delta: -1 }));
         assert_eq!(actions.get("pv-next"), Some(&Action::ImageStep { delta: 1 }));
-        assert_eq!(actions.get("pv-close"), Some(&Action::CloseImage));
-        assert_eq!(text_of(&tree, "hdr-title").as_deref(), Some("图片预览"));
+        // 形式同宿主灯箱：无关闭钮与按钮条，收起靠图外热区；键盘翻张声明在图片节点上（点图取焦点）
+        assert!(tree.find("pv-bar").is_none() && tree.find("pv-close").is_none());
+        assert_eq!(actions.get("pv-catcher"), Some(&Action::CloseImage));
+        assert_eq!(actions.get("pv-image"), Some(&Action::ImageKey));
+        assert_eq!(tree.find("pv-image").expect("大图应在树里").events, vec![EventKind::Key]);
+        // 浮层叠在表单之上，表单本身原样保留
+        assert!(matches!(&tree.find("pv-overlay").expect("预览浮层应在树里").body, NodeBody::Overlay { .. }));
+        assert!(tree.find(&ctl_id(&snapshot, &TableFormConfig::default(), "t")).is_some(), "浮层之下表单应还在");
+        // 只有一张时不画翻张钮与计数，收起热区常在
+        let single = snapshot_with(&["assets/a.png"]);
+        let (tree, actions) = build_view(&single, false, &previewing(&single, "assets/a.png"));
+        assert!(tree.find("pv-prev").is_none() && tree.find("pv-count").is_none());
+        assert_eq!(actions.get("pv-catcher"), Some(&Action::CloseImage));
     }
 
     #[test]
@@ -1133,7 +1149,6 @@ mod tests {
         // 焦点属于别的行：同样不预览
         let elsewhere = ImageFocus {
             row: Some("r9".to_string()),
-            cursors: HashMap::new(),
             preview: Some(Preview { field: "i".into(), path: "assets/a.png".into() }),
         };
         let (tree, _) = build_view(&snapshot, false, &elsewhere);
@@ -1141,10 +1156,34 @@ mod tests {
     }
 
     #[test]
-    fn previewing_an_unreadable_path_says_so() {
-        let snapshot = snapshot_with(&["https://example.com/b.png"]);
-        let (tree, _) = build_view(&snapshot, false, &previewing(&snapshot, "https://example.com/b.png"));
-        assert_eq!(text_of(&tree, "pv-image").as_deref(), Some("这张图片无法读取：https://example.com/b.png"));
+    fn previewing_an_unreadable_reference_says_so() {
+        let snapshot = snapshot_with(&["../走出仓库.png"]);
+        let (tree, _) = build_view(&snapshot, false, &previewing(&snapshot, "../走出仓库.png"));
+        assert_eq!(text_of(&tree, "pv-image").as_deref(), Some("这张图片无法读取：../走出仓库.png"));
+    }
+
+    #[test]
+    fn external_references_render_as_real_images() {
+        let snapshot = snapshot_with(&["https://example.com/a.png", "C:\\相册\\b.png", "assets/c.png", "../out.png", "data:image/png;base64,x"]);
+        let (tree, _) = build_with(&snapshot, false);
+        let slot = slot_of(&snapshot, &TableFormConfig::default(), "i");
+        for (index, source) in [
+            ImageSource::Url { url: "https://example.com/a.png".into(), local: None },
+            ImageSource::File { path: "C:\\相册\\b.png".into() },
+            ImageSource::Vault { path: "assets/c.png".into() },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let NodeBody::Image { source: got, .. } = &tree.find(&format!("img-th-{slot}-{index}")).expect("可读引用应出真图").body else {
+                panic!("第 {index} 张应是图片节点");
+            };
+            assert_eq!(got, &source);
+        }
+        // 越界段与其他协议：保留原文，不猜读法
+        for index in [3, 4] {
+            assert!(matches!(&tree.find(&format!("img-th-{slot}-{index}")).expect("不可读引用应保留原文").body, NodeBody::Text { .. }));
+        }
     }
 
     #[test]
@@ -1157,21 +1196,16 @@ mod tests {
         };
         assert_eq!((value.as_str(), placeholder.as_deref()), ("1:30:00", Some("如 1:30:00")));
         assert!(matches!(&tree.find(&ctl_id(&snapshot, &config, "n")).expect("数字框应在树里").body, NodeBody::NumberInput { value: Some(8.0), .. }));
-        // 主图是定正方、铺满裁切的大一号方块；缩略图条里每张也是同一张图的缩小版
+        // 缩略图是定方、铺满裁切的小方块
         let slot = slot_of(&snapshot, &config, "i");
-        let NodeBody::Image { source, fit, width, height } = &tree.find(&format!("img-{slot}-0")).expect("主图应在树里").body else {
-            panic!("仓库内路径应走图片节点");
-        };
-        assert_eq!(source, &ImageSource::Vault { path: "assets/a.png".to_string() });
-        assert_eq!(fit, &Some(ImageFit::Cover));
-        assert_eq!((*width, *height), (Some(SizeSpec::Fixed(MAIN_IMAGE)), Some(SizeSpec::Fixed(MAIN_IMAGE))));
         for (index, path) in ["assets/a.png", "备注 (v2).png"].iter().enumerate() {
-            let NodeBody::Image { source, width, height, .. } =
+            let NodeBody::Image { source, fit, width, height } =
                 &tree.find(&format!("img-th-{slot}-{index}")).expect("缩略图应在树里").body
             else {
                 panic!("仓库内路径应走图片节点");
             };
             assert_eq!(source, &ImageSource::Vault { path: path.to_string() });
+            assert_eq!(fit, &Some(ImageFit::Cover));
             assert_eq!((*width, *height), (Some(SizeSpec::Fixed(THUMB_IMAGE)), Some(SizeSpec::Fixed(THUMB_IMAGE))));
         }
         // 未列举类型只读：既不登记写入口，也不是输入控件
@@ -1180,29 +1214,27 @@ mod tests {
     }
 
     #[test]
-    fn single_image_still_gets_main_and_strip() {
+    fn single_image_still_gets_tile_and_add() {
         let snapshot = snapshot_with(&["assets/a.png"]);
         let config = TableFormConfig::default();
-        let (tree, _) = build_with(&snapshot, false);
+        let (tree, actions) = build_with(&snapshot, false);
         let slot = slot_of(&snapshot, &config, "i");
-        assert!(matches!(&tree.find(&format!("img-{slot}-0")).expect("主图应在树里").body, NodeBody::Image { .. }));
         assert!(matches!(&tree.find(&format!("img-th-{slot}-0")).expect("唯一那张缩略图应在树里").body, NodeBody::Image { .. }));
-        assert_eq!(text_of(&tree, &format!("img-count-{slot}")).as_deref(), Some("第 1 / 1 张"));
+        assert_eq!(actions.get(&format!("img-add-{slot}")), Some(&Action::AddImage { field: "i".to_string() }), "添加钮常在条尾");
     }
 
     #[test]
-    fn unreadable_image_paths_stay_visible_and_removable() {
-        let snapshot = snapshot_with(&["assets/a.png", "https://example.com/b.png"]);
+    fn unreadable_references_stay_visible_and_removable() {
+        let snapshot = snapshot_with(&["assets/a.png", "../走出仓库.png"]);
         let config = TableFormConfig::default();
-        let (tree, actions) = build_view(&snapshot, false, &focused(&snapshot, "https://example.com/b.png"));
+        let (tree, actions) = build_with(&snapshot, false);
         let slot = slot_of(&snapshot, &config, "i");
         assert!(matches!(&tree.find(&format!("img-th-{slot}-0")).expect("首张图应在树里").body, NodeBody::Image { .. }));
-        // 读不到仓库内容的路径：主图与缩略图都保留原文，也仍然能移除
-        assert_eq!(text_of(&tree, &format!("img-{slot}-1")).as_deref(), Some("https://example.com/b.png"));
-        assert_eq!(text_of(&tree, &format!("img-th-{slot}-1")).as_deref(), Some("https://example.com/b.png"));
-        assert_eq!(actions.get(&format!("img-rm-{slot}-1")), Some(&Action::RemoveImage { field: "i".to_string(), path: "https://example.com/b.png".to_string() }));
-        // 读不到的路径不登记看大图：点开只会是一块占位
-        assert!(!actions.contains_key(&format!("img-{slot}-1")), "非仓库路径不该有预览动作");
+        // 读不到内容的引用：缩略图保留原文，也仍然能移除
+        assert_eq!(text_of(&tree, &format!("img-th-{slot}-1")).as_deref(), Some("../走出仓库.png"));
+        assert_eq!(actions.get(&format!("img-rm-{slot}-1")), Some(&Action::RemoveImage { field: "i".to_string(), path: "../走出仓库.png".to_string() }));
+        // 读不到的引用不登记看大图：点开只会是一块占位
+        assert!(!actions.contains_key(&format!("img-th-{slot}-1")), "不可读引用不该有灯箱动作");
     }
 
     /// 单字段的数字格：界面里它占第 0 号节点。
@@ -1210,7 +1242,7 @@ mod tests {
         let fields = vec![Field { id: "n".into(), name: "工时".into(), kind: FieldType::Number, options: vec![] }];
         let mut cells = BTreeMap::new();
         cells.insert("n".to_string(), value);
-        TableSnapshot { path: "任务.atb".into(), fields, rows: vec![Row { id: "r".into(), cells }] }
+        TableSnapshot { path: "任务.atb".into(), fields, rows: vec![Row { id: "r".into(), cells }], ..Default::default() }
     }
 
     #[test]
@@ -1229,7 +1261,7 @@ mod tests {
         let fields = vec![Field { id: "s".into(), name: "状态".into(), kind: FieldType::SingleSelect, options: vec!["进行中".into()] }];
         let mut cells = BTreeMap::new();
         cells.insert("s".to_string(), CellValue::Choice(Some("已暂停".into())));
-        let snapshot = TableSnapshot { path: "任务.atb".into(), fields, rows: vec![Row { id: "r".into(), cells }] };
+        let snapshot = TableSnapshot { path: "任务.atb".into(), fields, rows: vec![Row { id: "r".into(), cells }], ..Default::default() };
 
         let config = TableFormConfig::default();
         let id = ctl_id(&snapshot, &config, "s");
@@ -1264,7 +1296,7 @@ mod tests {
 
     #[test]
     fn open_table_without_rows_shows_the_row_empty_state() {
-        let snapshot = TableSnapshot { path: "任务.atb".into(), fields: vec![title_field()], rows: Vec::new() };
+        let snapshot = TableSnapshot { path: "任务.atb".into(), fields: vec![title_field()], rows: Vec::new(), ..Default::default() };
         let (tree, actions) = build_with(&snapshot, false);
         assert_eq!(text_of(&tree, "hdr-pos").as_deref(), Some("暂无数据"));
         assert_eq!(text_of(&tree, "empty").as_deref(), Some("点「新增行」开始填写。"));

@@ -22,9 +22,10 @@ use std::time::Duration;
 
 use atelyx_plugin_sdk::protocol::event::{self, PublishParams, TableChangedPayload};
 use atelyx_plugin_sdk::protocol::method::{
-    ContributionSlot, NotificationLevel, SurfaceAttachedParams, SurfaceDetachedParams, ViewEventParams,
+    ContributionSlot, FileFilter, NotificationLevel, PickFileParams, SurfaceAttachedParams, SurfaceDetachedParams,
+    ViewEventParams,
 };
-use atelyx_plugin_sdk::protocol::view::{EventValue, ViewEvent, ViewNode};
+use atelyx_plugin_sdk::protocol::view::{EventValue, Key, KeyAction, NamedKey, ViewEvent, ViewNode};
 use atelyx_plugin_sdk::{run_stdio, view_builders, Context, PluginHandler, PluginInfo};
 use tokio::sync::Mutex;
 
@@ -60,16 +61,14 @@ fn image_paths(snapshot: &TableSnapshot, row_id: Option<&str>, field: &str) -> O
     Some(row.cell(field).images().to_vec())
 }
 
-/// 清掉指向不存在图片的焦点：行换了就整批归零；字段不再是图片列、或那一格已经不含这条引用，
-/// 就把这条焦点删掉（预览对不上时一并退出预览），让状态与界面说同一件事。
+/// 预览指向已被换掉那张、或那一格已不是图片列时退出预览；翻行 / 换表整批作废，
+/// 让状态与界面说同一件事。
 fn prune_image(focus: &mut ImageFocus, snapshot: &TableSnapshot, row_id: Option<&str>) {
     if focus.row.as_deref() != row_id {
         focus.row = row_id.map(str::to_string);
-        focus.cursors.clear();
         focus.preview = None;
         return;
     }
-    focus.cursors.retain(|field, path| image_paths(snapshot, row_id, field).is_some_and(|paths| paths.contains(path)));
     let stale = focus
         .preview
         .as_ref()
@@ -198,7 +197,11 @@ impl AppState {
             return;
         };
         if !same_table {
-            self.current_row = None;
+            // 换表 / 首次挂载：落在用户在网格里正看着的那一行，没有选区或该行已不在则回首行
+            self.current_row = current
+                .selected_row
+                .clone()
+                .filter(|id| current.row_index_of(id).is_some());
             self.show_settings = false;
             // 图片焦点属于原来那张表的行，留着会把旧引用落到新表的行上
             self.image = ImageFocus::default();
@@ -351,12 +354,18 @@ impl PluginHandler for TableForm {
             Action::NavPrev => {
                 st.step_row(-1);
                 st.status = None;
+                self.sync_selection(&mut st).await;
             }
             Action::NavNext => {
                 st.step_row(1);
                 st.status = None;
+                self.sync_selection(&mut st).await;
             }
-            Action::AddRow => report(ctx, add_row(self.provider.get(), &mut st).await).await,
+            Action::AddRow => {
+                report(ctx, add_row(self.provider.get(), &mut st).await).await;
+                self.sync_selection(&mut st).await;
+            }
+            Action::RemoveRow => report(ctx, remove_row(self.provider.get(), &mut st).await).await,
             Action::Refresh => {
                 // 重读失败时状态条里已经是失败原因，不能再报「已刷新」
                 if !boundary_failed {
@@ -391,21 +400,25 @@ impl PluginHandler for TableForm {
                     st.status = Some("这一格已经没有那张图片".to_string());
                 }
             },
-            Action::ShowImage { field, path } => {
+            Action::OpenImage { field, path } => {
                 if let Some(row_id) = st.current_row_id() {
-                    st.image.focus(&row_id, &field, &path);
+                    st.image.open(&row_id, &field, &path);
                 }
             }
-            Action::OpenImage { field } => match (st.current_row_id(), shown_image(&st, &field)) {
-                (Some(row_id), Some(path)) => st.image.open(&row_id, &field, &path),
-                // 界面已过期（这一格刚被清空）：点了没反应要说得出原因，不留静默失败
-                _ => {
-                    eprintln!("忽略没有可预览图片的请求：field = {field}");
-                    st.status = Some("这一格已经没有可预览的图片".to_string());
+            Action::ImageStep { delta } => step_image(&mut st, delta),
+            Action::ImageKey => {
+                // 预览浮层聚焦后的按键：左右翻张、Esc 关闭；抬起与未识别的键不动
+                if let ViewEvent::Key { key, action: KeyAction::Press, .. } = &params.event {
+                    match key {
+                        Key::Named { name: NamedKey::ArrowLeft } => step_image(&mut st, -1),
+                        Key::Named { name: NamedKey::ArrowRight } => step_image(&mut st, 1),
+                        Key::Named { name: NamedKey::Escape } => st.image.preview = None,
+                        _ => {}
+                    }
                 }
             },
-            Action::ImageStep { delta } => step_image(&mut st, delta),
             Action::CloseImage => st.image.preview = None,
+            Action::AddImage { field } => report(ctx, self.add_image(ctx, &mut st, &field).await).await,
             Action::ToggleField { field } => match event_bool(&params.event) {
                 Some(show) => {
                     edit_config(&mut st, |cfg| cfg.toggle_hidden(&field, show));
@@ -512,6 +525,59 @@ impl TableForm {
         let failures = write_cells(provider.as_ref(), st, vec![((row_id, field.to_string()), value)]).await;
         report(ctx, failures).await;
     }
+
+    /// 翻行 / 新增后把宿主表格选中态对到当前行：切回网格视图看到的是同一行。
+    /// 同步失败只影响网格侧的高亮，不弹通知，原因进状态条与控制台。
+    async fn sync_selection(&self, st: &mut AppState) {
+        let Some(provider) = self.provider.get() else { return };
+        let Some(row_id) = st.current_row_id() else { return };
+        if let Err(e) = provider.select_row(&row_id).await {
+            eprintln!("同步表格选中失败：{e}");
+            st.status = Some(format!("同步表格选中失败：{e}"));
+        }
+    }
+
+    /// 添加图片：选文件 → 导入仓库附件目录 → 追加进该格引用并整格写回。选择框取消不算失败；
+    /// 导入成功而写格失败时文件已落仓库（重试会多导一份），如实报错不静默。
+    async fn add_image(&self, ctx: &Context, st: &mut AppState, field: &str) -> Vec<String> {
+        let Some(provider) = self.provider.get() else {
+            return failure(st, "表格数据未就绪".to_string());
+        };
+        // 落点先确认：不是图片列、或现存值形态不符（写回会被接缝拒收）就不弹选择框、不导文件
+        if image_slot(st, field).is_none() {
+            return failure(st, "这一格存着与图片不符的值，先在表格里清掉再添加".to_string());
+        }
+        let Some(table_id) = st.snapshot.as_ref().and_then(|s| s.id.clone()) else {
+            return failure(st, "表格缺少稳定 id，无法导入图片".to_string());
+        };
+        let picked = ctx
+            .pick_file(PickFileParams {
+                title: Some("添加图片".to_string()),
+                save: None,
+                default_path: None,
+                filters: vec![FileFilter {
+                    name: "图片".to_string(),
+                    extensions: ["png", "jpg", "jpeg", "webp", "gif"].map(str::to_string).to_vec(),
+                }],
+            })
+            .await;
+        let source = match picked {
+            Ok(Some(path)) => path,
+            Ok(None) => return Vec::new(),
+            Err(e) => return failure(st, format!("打开文件选择失败：{e}")),
+        };
+        let path = match provider.import_image(&table_id, &source).await {
+            Ok(path) => path,
+            Err(e) => return failure(st, format!("导入图片失败：{e}")),
+        };
+        match image_plus(st, field, path) {
+            Some(value) => {
+                self.commit(ctx, st, field, value).await;
+                Vec::new()
+            }
+            None => failure(st, "这一格无法追加图片，请刷新后重试".to_string()),
+        }
+    }
 }
 
 /// 写完待写格子并按需重读快照（一次用户输入的收尾）。返回需要通知用户的失败原因。
@@ -613,6 +679,29 @@ async fn add_row(provider: Option<&Provider>, st: &mut AppState) -> Vec<String> 
     failures
 }
 
+/// 删除当前行（宿主有撤销栈兜底）。成功即从本地快照摘掉这一行，当前行落到原序号位置——
+/// 与重读后的锚定口径一致（远端广播的 `table:changed` 随后重读校正），界面不停在被删的行上。
+async fn remove_row(provider: Option<&Provider>, st: &mut AppState) -> Vec<String> {
+    let Some(provider) = provider else {
+        return failure(st, "表格数据未就绪".to_string());
+    };
+    let Some(row_id) = st.current_row_id() else {
+        return Vec::new();
+    };
+    if let Err(e) = provider.remove_row(&row_id).await {
+        return failure(st, format!("删除行失败：{e}"));
+    }
+    let snapshot = st.snapshot.as_mut().expect("current_row_id 命中即快照在");
+    let previous = snapshot.row_index_of(&row_id);
+    snapshot.rows.retain(|row| row.id != row_id);
+    let count = snapshot.rows.len();
+    st.current_row = previous
+        .map(|index| index.min(count.saturating_sub(1)))
+        .and_then(|index| snapshot.rows.get(index))
+        .map(|row| row.id.clone());
+    Vec::new()
+}
+
 /// 记下用户可见的失败原因，并作为待通知项返回。
 fn failure(st: &mut AppState, msg: String) -> Vec<String> {
     st.status = Some(msg.clone());
@@ -662,26 +751,22 @@ fn image_slot(st: &AppState, field: &str) -> Option<(String, ImageCell)> {
     Some((row.id.clone(), cell))
 }
 
-/// 界面正在显示的那一张的引用：与 `form` 的主图取法一致（焦点行不符、这一格已不含那张，都回第 0 张）。
-fn shown_image(st: &AppState, field: &str) -> Option<String> {
-    let (row_id, cell) = image_slot(st, field)?;
-    if cell.paths.is_empty() {
-        return None;
-    }
-    let index = st.image.cursor(&row_id, field, &cell.paths);
-    Some(cell.paths[index].clone())
+/// 在这一格现有引用后追加一张，其余路径与该格显示模式等原键保留。
+fn image_plus(st: &AppState, field: &str, path: String) -> Option<CellValue> {
+    let (_, cell) = image_slot(st, field)?;
+    let mut next = cell;
+    next.paths.push(path);
+    Some(CellValue::Images(next))
 }
 
-/// 预览里翻到相邻那张：首尾相接，并把主图焦点一起带到这一张——退出预览后显示的就是它。
-/// 预览指向的那张已不在格子里（被删了、或字段不再是图片列）时什么都不动。
+/// 预览里翻到相邻那张：首尾相接。预览指向的那张已不在格子里（被删了、或字段不再是
+/// 图片列）时什么都不动，交给下一次投影把预览收掉。
 fn step_image(st: &mut AppState, delta: isize) {
     let Some(preview) = st.image.preview.clone() else { return };
-    let Some((row_id, cell)) = image_slot(st, &preview.field) else { return };
+    let Some((_row_id, cell)) = image_slot(st, &preview.field) else { return };
     let Some(current) = cell.paths.iter().position(|path| path == &preview.path) else { return };
     let next = (current as isize + delta).rem_euclid(cell.paths.len() as isize) as usize;
-    let path = cell.paths[next].clone();
-    st.image.focus(&row_id, &preview.field, &path);
-    st.image.preview = Some(Preview { field: preview.field, path });
+    st.image.preview = Some(Preview { field: preview.field, path: cell.paths[next].clone() });
 }
 
 // ---------- 配置读写（插件自持数据，失败不静默） ----------
@@ -866,6 +951,8 @@ mod tests {
         writes: Arc<StdMutex<Vec<(String, String, CellValue)>>>,
         snapshot: Arc<StdMutex<Option<TableSnapshot>>>,
         added: Arc<StdMutex<Option<String>>>,
+        removed: Arc<StdMutex<Vec<String>>>,
+        selected: Arc<StdMutex<Vec<String>>>,
         fail: Arc<AtomicBool>,
     }
 
@@ -900,6 +987,23 @@ mod tests {
         async fn add_row(&self) -> Result<String, String> {
             self.wire.added.lock().unwrap().clone().ok_or_else(|| "假接缝未备好新行".to_string())
         }
+
+        async fn remove_row(&self, row_id: &str) -> Result<(), String> {
+            if self.wire.fail.load(Ordering::Relaxed) {
+                return Err("行不存在".to_string());
+            }
+            self.wire.removed.lock().unwrap().push(row_id.to_string());
+            Ok(())
+        }
+
+        async fn select_row(&self, row_id: &str) -> Result<(), String> {
+            self.wire.selected.lock().unwrap().push(row_id.to_string());
+            Ok(())
+        }
+
+        async fn import_image(&self, table_id: &str, _source: &str) -> Result<String, String> {
+            Ok(format!(".atelyx/temp/tables/{table_id}/img-fake.png"))
+        }
     }
 
     fn title_field() -> Field {
@@ -914,11 +1018,11 @@ mod tests {
     fn snapshot_typed(rows: &[&str]) -> TableSnapshot {
         let fields = vec![title_field(), duration_field()];
         let rows = rows.iter().map(|id| Row { id: id.to_string(), cells: BTreeMap::new() }).collect();
-        TableSnapshot { path: "任务.atb".into(), fields, rows }
+        TableSnapshot { path: "任务.atb".into(), fields, rows, ..Default::default() }
     }
 
     fn snapshot_with(rows: &[&str]) -> TableSnapshot {
-        TableSnapshot { rows: snapshot_typed(rows).rows, fields: vec![title_field()], path: "任务.atb".into() }
+        TableSnapshot { rows: snapshot_typed(rows).rows, fields: vec![title_field()], path: "任务.atb".into(), ..Default::default() }
     }
 
     fn state_with(rows: &[&str]) -> AppState {
@@ -1151,6 +1255,55 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_table_starts_on_the_host_selection() {
+        // 换表 / 首次挂载：快照带整行选区就落在那一行，切过来看到的是用户正看着的行
+        let mut other = snapshot_with(&["x1", "x2", "x3"]);
+        other.path = "另一张.atb".to_string();
+        other.selected_row = Some("x2".to_string());
+        let mut st = state_with(&["r1"]);
+        st.adopt(Some(other));
+        assert_eq!(st.current_row.as_deref(), Some("x2"));
+        // 选区指向的行不在快照里：回首行，不悬空
+        let mut gone = snapshot_with(&["y1"]);
+        gone.path = "再一张.atb".to_string();
+        gone.selected_row = Some("nope".to_string());
+        st.adopt(Some(gone));
+        assert_eq!(st.row_index(), 0);
+    }
+
+    #[tokio::test]
+    async fn removing_a_row_lands_where_it_stood() {
+        let provider = FakeProvider::new();
+        let boxed: Provider = Box::new(provider);
+        let mut st = state_with(&["r1", "r2", "r3"]);
+        st.current_row = Some("r2".to_string());
+        assert!(remove_row(Some(&boxed), &mut st).await.is_empty());
+        assert_eq!(st.current_row.as_deref(), Some("r3"), "被删的行让位，原序号位置顺延");
+        // 末行被删：落到新的末行，不悬空
+        st.current_row = Some("r3".to_string());
+        assert!(remove_row(Some(&boxed), &mut st).await.is_empty());
+        assert_eq!(st.current_row.as_deref(), Some("r1"));
+        // 最后一行被删：进空态
+        assert!(remove_row(Some(&boxed), &mut st).await.is_empty());
+        assert_eq!(st.current_row, None);
+        assert!(st.snapshot.as_ref().unwrap().rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_removal_keeps_the_row_and_reports() {
+        let provider = FakeProvider::new();
+        provider.wire.fail.store(true, Ordering::Relaxed);
+        let boxed: Provider = Box::new(provider);
+        let mut st = state_with(&["r1", "r2"]);
+        st.current_row = Some("r1".to_string());
+        let failures = remove_row(Some(&boxed), &mut st).await;
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("删除行失败"), "失败原因要可读：{failures:?}");
+        assert_eq!(st.current_row.as_deref(), Some("r1"), "删失败不得动本地快照");
+        assert_eq!(st.snapshot.as_ref().unwrap().rows.len(), 2);
+    }
+
+    #[test]
     fn row_step_clamps_at_both_ends() {
         let mut st = state_with(&["r1", "r2"]);
         st.step_row(-1);
@@ -1177,16 +1330,14 @@ mod tests {
         let mut cells = BTreeMap::new();
         let paths = paths.iter().map(|p| p.to_string()).collect();
         cells.insert("i".to_string(), CellValue::Images(ImageCell { paths, extra }));
-        TableSnapshot { path: "任务/看板.atb".into(), fields, rows: vec![Row { id: "r1".into(), cells }] }
+        TableSnapshot { path: "任务/看板.atb".into(), fields, rows: vec![Row { id: "r1".into(), cells }], ..Default::default() }
     }
 
-    /// 主图停在 `path` 那一张、且正在看大图。
+    /// 正在看 `path` 那一张的大图。
     fn preview_focus(row: &str, field: &str, path: &str) -> ImageFocus {
-        ImageFocus {
-            row: Some(row.to_string()),
-            cursors: [(field.to_string(), path.to_string())].into(),
-            preview: Some(Preview { field: field.to_string(), path: path.to_string() }),
-        }
+        let mut focus = ImageFocus::default();
+        focus.open(row, field, path);
+        focus
     }
 
     #[test]
@@ -1209,16 +1360,27 @@ mod tests {
     }
 
     #[test]
+    fn adding_an_image_appends_and_keeps_cell_keys() {
+        let st = image_state(&["assets/a.png"]);
+        let value = image_plus(&st, "i", "assets/b.png".to_string()).expect("应能追加");
+        let CellValue::Images(cell) = &value else {
+            panic!("应还是图片格");
+        };
+        assert_eq!(cell.paths, ["assets/a.png", "assets/b.png"]);
+        assert_eq!(cell.extra.get("display"), Some(&json!("grid")), "追加一张不该改掉显示模式");
+        // 非图片格不接受追加（这里 `t` 是文本列）
+        assert!(image_plus(&st, "t", "assets/b.png".to_string()).is_none());
+    }
+
+    #[test]
     fn preview_steps_wrap_around_the_list() {
         let mut st = image_state(&["a.png", "b.png", "c.png"]);
         let row = st.current_row_id().unwrap();
         st.image.open(&row, "i", "a.png");
         step_image(&mut st, -1);
         assert_eq!(st.image.preview, Some(Preview { field: "i".into(), path: "c.png".into() }), "第一张往前应到最后一张");
-        assert_eq!(st.image.cursors.get("i").map(String::as_str), Some("c.png"), "主图焦点要跟着预览走，退出预览后显示的就是这张");
         step_image(&mut st, 1);
         assert_eq!(st.image.preview, Some(Preview { field: "i".into(), path: "a.png".into() }));
-        assert_eq!(st.image.cursors.get("i").map(String::as_str), Some("a.png"));
     }
 
     #[test]
@@ -1232,28 +1394,13 @@ mod tests {
     }
 
     #[test]
-    fn shown_image_counts_the_projection_not_just_the_disk() {
-        let mut st = image_state(&["a.png"]);
-        assert_eq!(shown_image(&st, "i").as_deref(), Some("a.png"));
-        // 待写里已排进第二张：界面显示的是投影那一份，焦点也按它找
-        let next = CellValue::Images(ImageCell { paths: vec!["a.png".into(), "b.png".into()], ..ImageCell::default() });
-        st.pending.insert(("r1".to_string(), "i".to_string()), next);
-        st.image.focus("r1", "i", "b.png");
-        assert_eq!(shown_image(&st, "i").as_deref(), Some("b.png"));
-        // 待写把这一格清空的：没有可预览的一张
-        let mut cleared = image_state(&["a.png"]);
-        cleared.pending.insert(("r1".to_string(), "i".to_string()), CellValue::Images(ImageCell::default()));
-        assert_eq!(shown_image(&cleared, "i"), None, "格子里没图就不该进预览");
-    }
-
-    #[test]
     fn switching_tables_drops_the_image_focus() {
         let mut st = image_state(&["a.png", "b.png"]);
-        st.image.focus("r1", "i", "b.png");
+        st.image.open("r1", "i", "b.png");
         let mut other = snapshot_with(&["x1"]);
         other.path = "另一张.atb".to_string();
         st.adopt(Some(other));
-        assert!(st.image.cursors.is_empty() && st.image.row.is_none(), "旧表的图片焦点不该带过来");
+        assert!(st.image.preview.is_none() && st.image.row.is_none(), "旧表的图片焦点不该带过来");
     }
 
     #[test]
@@ -1264,22 +1411,21 @@ mod tests {
         prune_image(&mut image, &snapshot, Some("r1"));
         assert_eq!(image.preview, Some(Preview { field: "i".to_string(), path: "assets/b.png".to_string() }), "这一格还含那条引用时焦点应留着");
 
-        // 那张被换掉了：指向它的焦点与预览都作废
+        // 那张被换掉了：预览作废退出
         let shrunk = image_snapshot(&["assets/c.png"]);
         let mut image = preview_focus("r1", "i", "assets/b.png");
         prune_image(&mut image, &shrunk, Some("r1"));
         assert_eq!(image.preview, None, "预览目标没了就退出预览");
-        assert!(!image.cursors.contains_key("i"), "找不到引用的焦点应删掉，界面回第一张");
 
-        // 指向非图片列的焦点（字段刚改过类型）：一并清掉
+        // 指向非图片列的预览（字段刚改过类型）：一并清掉
         let mut image = preview_focus("r1", "t", "assets/a.png");
         prune_image(&mut image, &snapshot, Some("r1"));
-        assert!(image.cursors.is_empty() && image.preview.is_none(), "非图片列的焦点该清");
+        assert_eq!(image.preview, None, "非图片列的预览该清");
 
-        // 翻行：旧行的引用对不上新行，整批归零
+        // 翻行：旧行的引用对不上新行，预览归零
         let mut image = preview_focus("r1", "i", "assets/b.png");
         prune_image(&mut image, &snapshot, Some("r9"));
         assert_eq!(image.row.as_deref(), Some("r9"));
-        assert!(image.cursors.is_empty() && image.preview.is_none());
+        assert_eq!(image.preview, None);
     }
 }

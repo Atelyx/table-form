@@ -289,6 +289,18 @@ pub fn parse_duration(text: &str) -> Option<f64> {
     Some(total * sign)
 }
 
+/// 可导入图片格的文件扩展名 → 仓库附件统一扩展名（白名单外拒绝，与宿主图片附件口径一致）。
+pub fn image_ext_of(file_name: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(file_name).extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("png"),
+        "jpg" | "jpeg" => Some("jpg"),
+        "webp" => Some("webp"),
+        "gif" => Some("gif"),
+        _ => None,
+    }
+}
+
 fn foreign_text(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
@@ -319,8 +331,12 @@ impl Row {
 pub struct TableSnapshot {
     /// 表格文件的仓库相对路径，同时是表单配置的分键。
     pub path: String,
+    /// 表格稳定 id（宿主分配，改名 / 移动后不变）；图片附件目录按它落位。
+    pub id: Option<String>,
     pub fields: Vec<Field>,
     pub rows: Vec<Row>,
+    /// 快照时刻用户在网格里正选中的行（整行选区才收，其余选区形态不进表单）。
+    pub selected_row: Option<String>,
 }
 
 impl TableSnapshot {
@@ -349,6 +365,13 @@ pub trait TableProvider: Send + Sync {
     async fn snapshot(&self) -> Result<Option<TableSnapshot>, String>;
     async fn update_cell(&self, row_id: &str, field_id: &str, value: &CellValue) -> Result<(), String>;
     async fn add_row(&self) -> Result<String, String>;
+    /// 删除一行（宿主有撤销栈兜底）。
+    async fn remove_row(&self, row_id: &str) -> Result<(), String>;
+    /// 写宿主选中态：翻行 / 新增后让网格视图跟上，切回去看到的是同一行。
+    async fn select_row(&self, row_id: &str) -> Result<(), String>;
+    /// 把本机图片文件导入表格附件目录（`.atelyx/temp/tables/<表格 id>/`，删表时宿主连带清理），
+    /// 返回仓库相对路径；`Ok` 之前文件已确实落到仓库。非图片扩展名拒绝。
+    async fn import_image(&self, table_id: &str, source: &str) -> Result<String, String>;
 }
 
 #[cfg(test)]
@@ -463,11 +486,7 @@ mod tests {
 
     #[test]
     fn display_name_strips_path_and_extension() {
-        let snapshot = TableSnapshot {
-            path: "任务/看板 v2.atb".into(),
-            fields: vec![],
-            rows: vec![],
-        };
+        let snapshot = TableSnapshot { path: "任务/看板 v2.atb".into(), ..Default::default() };
         assert_eq!(snapshot.display_name(), "看板 v2");
     }
 }
