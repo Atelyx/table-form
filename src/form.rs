@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use atelyx_plugin_sdk::protocol::view::{
-    Align, Axis, BoxSize, ButtonVariant, CardTone, ColorSpec, ColorToken, ControlSize, EventKind,
+    Align, Axis, BoxSize, ButtonVariant, CardTone, ColorSpec, ColorToken, ControlSize, EdgesPadding, EventKind,
     ImageFit,
     ImageSource, Justify, NodeBody, PaddingSpec, SizeSpec, TextWeight, ViewNode,
 };
@@ -98,28 +98,59 @@ pub struct FormView<'a> {
     pub image: &'a ImageFocus,
 }
 
-/// 缩略图边长与图条高度、方块间隙；预览大图定高（铺满可用宽，四周由浮层边距留白）。
+/// 缩略图边长与图条高度、方块间隙；预览大图定高（宽随可见画面收缩）。
 const THUMB_IMAGE: f32 = 40.0;
 const THUMB_STRIP: f32 = 64.0;
 const IMAGE_GAP: f32 = 4.0;
 const PREVIEW_HEIGHT: f32 = 480.0;
+/// 贡献外边距为零（滚动条贴面缘）后，树内自担的呼吸边距：水平贴边距离与上下留白。
+const SURFACE_PAD_H: f32 = 12.0;
+const SURFACE_PAD_TOP: f32 = 10.0;
+const SURFACE_PAD_BOTTOM: f32 = 10.0;
+
 /// 构建整棵界面树，并返回「节点 id → 动作」映射。
-/// 大图预览是根列上的一层面内浮层：树里出现即打开，遮罩拦下下层交互，表单本身保持原样。
+/// 顶部区自带呼吸边距，滚动区直抵面缘（滚动条贴边）；大图预览是根列上的一层面内浮层。
 pub fn build(view: &FormView) -> (ViewNode, HashMap<String, Action>) {
     let mut actions: HashMap<String, Action> = HashMap::new();
     let mut top: Vec<ViewNode> = vec![header(view, &mut actions)];
     if let Some(status) = view.status {
         top.push(muted_sized("status", status.to_string(), 0.9));
     }
-    top.push(match view.show_settings {
+    let body = match view.show_settings {
         true => settings(view, &mut actions),
         false => form_body(view, &mut actions),
-    });
-    let mut root = column("root", 12.0, top);
-    if let Some(target) = preview_target(view) {
-        root.children.push(preview_overlay(&target, &mut actions));
-    }
+    };
+    let root = column("root", 12.0, vec![padded_block("top", 12.0, SURFACE_PAD_TOP, 0.0, top), body]);
+    let (root, actions) = match preview_target(view) {
+        // 预览浮层出现时表单本身原样保留在树里
+        Some(target) => {
+            let mut root = root;
+            root.children.push(preview_overlay(&target, &mut actions));
+            (root, actions)
+        }
+        None => (root, actions),
+    };
     (root, actions)
+}
+
+/// 带面内边距的整宽列：顶部区与滚动内容用它补回贡献外边距让出的呼吸空间。
+fn padded_block(id: &str, gap: f32, top: f32, bottom: f32, children: Vec<ViewNode>) -> ViewNode {
+    node(
+        id,
+        NodeBody::Column {
+            gap: Some(gap),
+            padding: Some(PaddingSpec::Edges(EdgesPadding {
+                top,
+                right: SURFACE_PAD_H,
+                bottom,
+                left: SURFACE_PAD_H,
+            })),
+            cross_align: None,
+            align: None,
+            size: Some(BoxSize { width: Some(SizeSpec::Fill), ..BoxSize::default() }),
+        },
+    )
+    .with_children(children)
 }
 
 /// 预览目标：字段不是图片列、当前行没有那张图、这一格已经不含那条引用，都回 `None`
@@ -201,9 +232,9 @@ fn header(view: &FormView, actions: &mut HashMap<String, Action>) -> ViewNode {
 /// 设置态只保留「字段设置 + 完成」，翻行与写值操作在这里没有意义。
 fn settings_header(view: &FormView, actions: &mut HashMap<String, Action>) -> ViewNode {
     let subtitle = if view.snapshot.is_open() {
-        format!("{} · 改动即时保存", view.snapshot.display_name())
+        format!("{} · 改动自动保存", view.snapshot.display_name())
     } else {
-        "改动即时保存".to_string()
+        "改动自动保存".to_string()
     };
     let info = column(
         "hdr-info",
@@ -224,15 +255,15 @@ fn toolbar_card(line: ViewNode) -> ViewNode {
 
 fn form_body(view: &FormView, actions: &mut HashMap<String, Action>) -> ViewNode {
     if !view.snapshot.is_open() {
-        return empty_state("未打开表格", "打开一个 .atb 表格后即可按行填写。", false, actions);
+        return form_scroll(vec![empty_state("未打开表格", "打开一个 .atb 表格后即可按行填写。", false, actions)]);
     }
     let Some(record) = view.snapshot.rows.get(view.row_index) else {
-        return empty_state("还没有数据行", "点「新增行」开始填写。", true, actions);
+        return form_scroll(vec![empty_state("还没有数据行", "点「新增行」开始填写。", true, actions)]);
     };
     let fields = view.config.visible_fields(view.snapshot);
     if fields.is_empty() {
         let hint = column("form-fields", 8.0, vec![muted("empty", "没有可显示的字段，点右上角设置调出字段。")]);
-        return scroll("form", vec![card("form-sheet", vec![hint])]);
+        return form_scroll(vec![card("form-sheet", vec![hint])]);
     }
     let mut blocks: Vec<ViewNode> = Vec::with_capacity(fields.len() * 2);
     for (slot, field) in fields.iter().enumerate() {
@@ -241,7 +272,12 @@ fn form_body(view: &FormView, actions: &mut HashMap<String, Action>) -> ViewNode
         }
         blocks.push(field_block(view, record, slot, field, actions));
     }
-    scroll("form", vec![card("form-sheet", vec![column("form-fields", 14.0, blocks)])])
+    form_scroll(vec![card("form-sheet", vec![column("form-fields", 14.0, blocks)])])
+}
+
+/// 滚动填写区：呼吸边距补在滚动内容里，滚动条直抵面缘。
+fn form_scroll(children: Vec<ViewNode>) -> ViewNode {
+    scroll("form", vec![padded_block("form-pad", 0.0, 0.0, SURFACE_PAD_BOTTOM, children)])
 }
 
 fn empty_state(title: &str, hint: &str, can_add: bool, actions: &mut HashMap<String, Action>) -> ViewNode {
@@ -268,7 +304,7 @@ fn empty_state(title: &str, hint: &str, can_add: bool, actions: &mut HashMap<Str
         ));
     }
     let body = column("empty-col", 10.0, parts);
-    scroll("form", vec![card_tone("empty-card", CardTone::Default, 10.0, 28.0, vec![body])])
+    card_tone("empty-card", CardTone::Default, 10.0, 28.0, vec![body])
 }
 
 fn field_block(
@@ -469,56 +505,50 @@ fn thumb_tile(slot: usize, field: &str, index: usize, path: &str, actions: &mut 
     thumb_card(&format!("img-card-{slot}-{index}"), vec![tile])
 }
 
-/// 预览浮层：形式与宿主表格的图片灯箱一致——整面遮罩上一张 Contain 大图，点图片外任意处
-/// 收起，没有关闭钮；多张时翻张钮贴左右缘居中、「N / M」贴底居中。图片节点声明 `key`：
-/// 点图片取得键盘焦点，随后左右键翻张、Esc 关闭——落在图片身上的按下被图片节点截住
-/// （取焦点的手势），不会落到底层收起热区，点图才不会误关。
+/// 预览浮层：收起交给宿主 Overlay 的内建灯箱语义——浮层节点声明 `click`，宿主在
+/// 「内容矩形之外」的按下-抬起上回发该节点的点击；遮罩区域光标为普通箭头，与按钮的手型区分。
+/// 内容是大图本体（宽随内容收缩，控件矩形即 Contain 适配后的可见画面）：点画面取得键盘焦点
+/// （随后左右键翻张、Esc 收起），点画面外任意处收起。翻张钮贴画面左右缘居中、计数贴画面底缘
+/// 居中，都随画面矩形走；宽高比极端的画面（超宽全景）上下会留无Hit的收起死角。
 fn preview_overlay(target: &PreviewTarget, actions: &mut HashMap<String, Action>) -> ViewNode {
     let count = target.paths.len();
     let path = &target.paths[target.index];
-    let mut parts: Vec<ViewNode> = vec![{
-        // 底层收起热区：铺满整面，图片外的按下都落到这里
-        let mut catcher = fill_layer("pv-catcher");
-        catcher.events = vec![EventKind::Click];
-        actions.insert(catcher.id.clone(), Action::CloseImage);
-        catcher
-    }];
-    parts.push(preview_center(match image_source(path) {
+    let image = match image_source(path) {
         Some(source) => {
-            let mut image = image_node("pv-image", source, ImageFit::Contain, SizeSpec::Fill, SizeSpec::Fixed(PREVIEW_HEIGHT));
+            let mut image = image_node("pv-image", source, ImageFit::Contain, SizeSpec::Shrink, SizeSpec::Fixed(PREVIEW_HEIGHT));
             image.events = vec![EventKind::Key];
             actions.insert(image.id.clone(), Action::ImageKey);
             image
         }
         None => muted("pv-image", format!("这张图片无法读取：{path}")),
-    }));
+    };
+    // 叠层尺寸由底层（大图）决定：贴边槽撑满同一矩形，把钮推到画面的左右缘与底缘
+    let mut stack = node("pv-view", NodeBody::Stack {}).with_children(vec![image]);
     if count > 1 {
-        parts.push(overlay_slot(
-            "pv-prev-wrap",
+        stack.children.push(full_slot(
+            "pv-nav",
+            Some(Justify::SpaceBetween),
             Some(Align::Center),
-            None,
-            icon_sized("pv-prev", "chevron-left", "上一张", true, ControlSize::Md, Action::ImageStep { delta: -1 }, actions),
+            vec![
+                icon_sized("pv-prev", "chevron-left", "上一张", true, ControlSize::Md, Action::ImageStep { delta: -1 }, actions),
+                icon_sized("pv-next", "chevron-right", "下一张", true, ControlSize::Md, Action::ImageStep { delta: 1 }, actions),
+            ],
         ));
-        parts.push(overlay_slot(
-            "pv-next-wrap",
-            Some(Align::Center),
-            Some(Justify::End),
-            icon_sized("pv-next", "chevron-right", "下一张", true, ControlSize::Md, Action::ImageStep { delta: 1 }, actions),
-        ));
-        parts.push(overlay_slot(
+        stack.children.push(full_slot(
             "pv-count-wrap",
-            Some(Align::End),
             Some(Justify::Center),
-            text_sized("pv-count", format!("{}/{}", target.index + 1, count), 0.9, None, Some(ColorToken::Text)),
+            Some(Align::End),
+            vec![text_sized("pv-count", format!("{}/{}", target.index + 1, count), 0.9, None, Some(ColorToken::Text))],
         ));
     }
-    node("pv-overlay", NodeBody::Overlay { scrim: None })
-        .with_children(vec![node("pv-view", NodeBody::Stack {}).with_children(parts)])
+    let mut overlay = node("pv-overlay", NodeBody::Overlay { scrim: None }).with_children(vec![stack]);
+    overlay.events = vec![EventKind::Click];
+    actions.insert(overlay.id.clone(), Action::CloseImage);
+    overlay
 }
 
-/// 灯箱贴边槽：高度铺满浮层、宽度随内容的行，把单个子项摆到指定角落。
-/// 宽度不能声明 Fill：撑满的行自己就是整行，外层容器的 justify 对齐会失效（宿主 Row 同款规则）。
-fn overlay_slot(id: &str, cross_align: Option<Align>, justify: Option<Justify>, child: ViewNode) -> ViewNode {
+/// 灯箱贴边槽：铺满画面矩形的行，`justify` 与 `cross_align` 把单个子项摆到指定边。
+fn full_slot(id: &str, justify: Option<Justify>, cross_align: Option<Align>, children: Vec<ViewNode>) -> ViewNode {
     node(
         id,
         NodeBody::Row {
@@ -526,39 +556,14 @@ fn overlay_slot(id: &str, cross_align: Option<Align>, justify: Option<Justify>, 
             padding: Some(PaddingSpec::All(8.0)),
             justify,
             cross_align,
-            size: Some(BoxSize { height: Some(SizeSpec::Fill), ..BoxSize::default() }),
+            size: Some(BoxSize {
+                width: Some(SizeSpec::Fill),
+                height: Some(SizeSpec::Fill),
+                ..BoxSize::default()
+            }),
         },
     )
-    .with_children(vec![child])
-}
-
-/// 灯箱中图槽：铺满整面的行，图片带四周遮罩边距、垂直水平居中。
-fn preview_center(child: ViewNode) -> ViewNode {
-    node(
-        "pv-center",
-        NodeBody::Row {
-            gap: None,
-            padding: Some(PaddingSpec::All(24.0)),
-            justify: Some(Justify::Center),
-            cross_align: Some(Align::Center),
-            size: Some(BoxSize { width: Some(SizeSpec::Fill), height: Some(SizeSpec::Fill), ..BoxSize::default() }),
-        },
-    )
-    .with_children(vec![child])
-}
-
-/// 铺满父容器的空白行：浮层里当收起热区（整面底层）。
-fn fill_layer(id: &str) -> ViewNode {
-    node(
-        id,
-        NodeBody::Row {
-            gap: None,
-            padding: None,
-            justify: None,
-            cross_align: None,
-            size: Some(BoxSize { width: Some(SizeSpec::Fill), height: Some(SizeSpec::Fill), ..BoxSize::default() }),
-        },
-    )
+    .with_children(children)
 }
 
 /// 图片引用 → 图源：http(s) 外链走远程图，本机绝对路径（盘符 / UNC / 根相对）走文件源，
@@ -673,7 +678,7 @@ fn settings(view: &FormView, actions: &mut HashMap<String, Action>) -> ViewNode 
             grid,
         ],
     );
-    scroll("settings", vec![list])
+    scroll("settings", vec![padded_block("settings-pad", 0.0, 0.0, SURFACE_PAD_BOTTOM, vec![list])])
 }
 
 // ---------- 节点构造辅助（直接构 NodeBody 以带 weight/color/enabled/placeholder 等字段） ----------
@@ -1119,23 +1124,26 @@ mod tests {
         };
         assert_eq!(source, &ImageSource::Vault { path: "assets/b.png".to_string() });
         assert_eq!(fit, &Some(ImageFit::Contain));
-        assert_eq!((*width, *height), (Some(SizeSpec::Fill), Some(SizeSpec::Fixed(PREVIEW_HEIGHT))));
+        // 宽随内容收缩：控件矩形贴合 Contain 适配后的可见画面，点画面外才收得起
+        assert_eq!((*width, *height), (Some(SizeSpec::Shrink), Some(SizeSpec::Fixed(PREVIEW_HEIGHT))));
         assert_eq!(text_of(&tree, "pv-count").as_deref(), Some("2/3"));
         assert_eq!(actions.get("pv-prev"), Some(&Action::ImageStep { delta: -1 }));
         assert_eq!(actions.get("pv-next"), Some(&Action::ImageStep { delta: 1 }));
-        // 形式同宿主灯箱：无关闭钮与按钮条，收起靠图外热区；键盘翻张声明在图片节点上（点图取焦点）
+        // 收起交给 Overlay 内建语义：浮层声明 click（宿主在内容之外回发），无关闭钮与按钮条
         assert!(tree.find("pv-bar").is_none() && tree.find("pv-close").is_none());
-        assert_eq!(actions.get("pv-catcher"), Some(&Action::CloseImage));
+        assert!(tree.find("pv-catcher").is_none(), "收起热区不该自建，由浮层遮罩承担");
+        assert_eq!(actions.get("pv-overlay"), Some(&Action::CloseImage));
+        assert_eq!(tree.find("pv-overlay").expect("浮层应在树里").events, vec![EventKind::Click]);
         assert_eq!(actions.get("pv-image"), Some(&Action::ImageKey));
         assert_eq!(tree.find("pv-image").expect("大图应在树里").events, vec![EventKind::Key]);
         // 浮层叠在表单之上，表单本身原样保留
         assert!(matches!(&tree.find("pv-overlay").expect("预览浮层应在树里").body, NodeBody::Overlay { .. }));
         assert!(tree.find(&ctl_id(&snapshot, &TableFormConfig::default(), "t")).is_some(), "浮层之下表单应还在");
-        // 只有一张时不画翻张钮与计数，收起热区常在
+        // 只有一张时不画翻张钮与计数
         let single = snapshot_with(&["assets/a.png"]);
         let (tree, actions) = build_view(&single, false, &previewing(&single, "assets/a.png"));
         assert!(tree.find("pv-prev").is_none() && tree.find("pv-count").is_none());
-        assert_eq!(actions.get("pv-catcher"), Some(&Action::CloseImage));
+        assert_eq!(actions.get("pv-overlay"), Some(&Action::CloseImage));
     }
 
     #[test]
@@ -1337,6 +1345,34 @@ mod tests {
             assert!(tree.find(&format!("div-{slot}")).is_some(), "字段之间应有分隔线");
         }
         assert!(tree.find("div-0").is_none(), "首个字段前不画分隔线");
+    }
+
+    #[test]
+    fn breathing_padding_stays_inside_the_surface() {
+        // 贡献外边距为零让滚动条贴面缘：呼吸边距由顶部区与滚动内容自担，滚动容器直抵面缘
+        let snapshot = snapshot_with(&["assets/a.png"]);
+        let (tree, _) = build_with(&snapshot, false);
+        let root = tree.find("root").expect("根列应在树里");
+        assert!(matches!(root.body, NodeBody::Column { .. }));
+        let root_kids = &root.children;
+        assert_eq!(root_kids.len(), 2, "根下应是顶部区 + 滚动区两块");
+        let NodeBody::Column { padding: Some(PaddingSpec::Edges(top_pad)), .. } = &root_kids[0].body else {
+            panic!("顶部区应自带呼吸边距");
+        };
+        assert_eq!((top_pad.top, top_pad.bottom), (SURFACE_PAD_TOP, 0.0), "顶部区只补上缘");
+        assert_eq!((top_pad.left, top_pad.right), (SURFACE_PAD_H, SURFACE_PAD_H));
+        assert!(matches!(&root_kids[1].body, NodeBody::Scroll { .. }), "滚动区直抵面缘");
+        let NodeBody::Column { padding: Some(PaddingSpec::Edges(body_pad)), .. } = &root_kids[1].children[0].body else {
+            panic!("滚动内容应自带呼吸边距");
+        };
+        assert_eq!((body_pad.top, body_pad.bottom), (0.0, SURFACE_PAD_BOTTOM), "滚动内容只补下缘");
+        assert_eq!((body_pad.left, body_pad.right), (SURFACE_PAD_H, SURFACE_PAD_H));
+        // 设置态同口径
+        let (tree, _) = build_with(&snapshot, true);
+        let NodeBody::Scroll { .. } = &tree.find("root").expect("根列应在树里").children[1].body else {
+            panic!("设置区滚动容器应直抵面缘");
+        };
+        assert!(tree.find("settings-pad").is_some());
     }
 
     #[test]

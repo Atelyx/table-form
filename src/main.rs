@@ -25,7 +25,7 @@ use atelyx_plugin_sdk::protocol::method::{
     ContributionSlot, FileFilter, NotificationLevel, PickFileParams, SurfaceAttachedParams, SurfaceDetachedParams,
     ViewEventParams,
 };
-use atelyx_plugin_sdk::protocol::view::{EventValue, Key, KeyAction, NamedKey, ViewEvent, ViewNode};
+use atelyx_plugin_sdk::protocol::view::{EventValue, Key, KeyAction, NamedKey, PaddingSpec, ViewEvent, ViewNode};
 use atelyx_plugin_sdk::{run_stdio, view_builders, Context, PluginHandler, PluginInfo};
 use tokio::sync::Mutex;
 
@@ -100,6 +100,10 @@ struct AppState {
     flush_epoch: u64,
     /// 是否还有一个没醒的防抖任务：只有「还在打字」才把表格变更推迟到写完再读。
     flush_scheduled: bool,
+    /// 设置改动经防抖落盘的纪元，与 [`AppState::flush_epoch`] 同一套配对规则。
+    config_epoch: u64,
+    /// 是否还有一个没醒的设置防抖任务：收尾点据此就地落盘，不等定时器。
+    config_scheduled: bool,
     /// 有待写期间收到的表格变更：写完再重读。
     reload_requested: bool,
     /// 界面当前是否挂在宿主面上（未挂载时提交过去只会是无效功）。
@@ -109,9 +113,13 @@ struct AppState {
 }
 
 impl AppState {
-    /// 表单配置的按键：当前表格的仓库相对路径；未打开表格 = `None`。
+    /// 表单配置的按键：表格稳定 id 优先（改名 / 移动后不变），宿主未给 id 的表退回
+    /// 仓库相对路径；未打开表格 = `None`。
     fn table_key(&self) -> Option<&str> {
-        self.snapshot.as_ref().filter(|s| s.is_open()).map(|s| s.path.as_str())
+        self.snapshot
+            .as_ref()
+            .filter(|s| s.is_open())
+            .map(|s| s.id.as_deref().unwrap_or(&s.path))
     }
 
     /// 当前行序号：锚点不在行集里（远端删行且尚未重读）则回到首行。
@@ -172,6 +180,19 @@ impl AppState {
         self.flush_epoch += 1;
         self.flush_scheduled = false;
         had
+    }
+
+    /// 登记一次待落盘的设置改动；防抖任务只对得上最新一次，旧的直接退出。
+    fn schedule_config_save(&mut self) -> u64 {
+        self.config_epoch += 1;
+        self.config_scheduled = true;
+        self.config_epoch
+    }
+
+    /// 让还没醒的设置防抖任务失配：落盘改由当前调用就地完成。
+    fn cancel_config_flush(&mut self) {
+        self.config_epoch += 1;
+        self.config_scheduled = false;
     }
 
     /// 写入成功后同步本地快照，免得等下一次重读期间界面显示旧值。
@@ -246,6 +267,21 @@ impl TableForm {
             render(&ctx, &mut st, &tree).await;
         });
     }
+
+    /// 设置改动停手后落盘：提示文字逐键落盘会把整份配置反复写穿，与正文写回同一节奏。
+    fn schedule_config_flush(&self, ctx: &Context, epoch: u64) {
+        let state = self.state.clone();
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(FLUSH_DEBOUNCE).await;
+            let mut st = state.lock().await;
+            if st.config_epoch != epoch {
+                return;
+            }
+            st.config_scheduled = false;
+            persist_config(&ctx, &mut st).await;
+        });
+    }
 }
 
 #[async_trait::async_trait]
@@ -265,7 +301,16 @@ impl PluginHandler for TableForm {
             eprintln!("订阅表格变更失败：{e}");
             notify(ctx, "订阅表格变更失败，界面不会随表格自动刷新", NotificationLevel::Warning).await;
         }
-        if let Err(e) = ctx.register(ContributionSlot::TableView, SURFACE, "表格表单", Some("table"), None).await {
+        // 贡献外边距声明为零：滚动条贴面板边缘，呼吸边距由界面树内自担（form.rs/`padded_block`）
+        if let Err(e) = ctx.register(
+            ContributionSlot::TableView,
+            SURFACE,
+            "表格表单",
+            Some("table"),
+            Some(PaddingSpec::All(0.0)),
+        )
+        .await
+        {
             eprintln!("注册表格视图贡献失败：{e}");
             notify(ctx, &format!("注册表格视图失败：{e}"), NotificationLevel::Error).await;
         }
@@ -289,6 +334,10 @@ impl PluginHandler for TableForm {
         if st.discard_pending() {
             notify(ctx, DISCARDED_HINT, NotificationLevel::Warning).await;
         }
+        // 上一次挂载可能还有设置改动挂在防抖上：配置按键是表格级的，就地补写不丢
+        if st.config_scheduled {
+            persist_config(ctx, &mut st).await;
+        }
         // 挂载即一次全新投影：以宿主当前打开的表格为准
         report(ctx, settle(self.provider.get(), &mut st, true).await).await;
         render(ctx, &mut st, &self.tree).await;
@@ -300,6 +349,11 @@ impl PluginHandler for TableForm {
         }
         let mut st = self.state.lock().await;
         st.mounted = false;
+        // 设置改动若还挂在防抖上，先就地落盘再结算：之后的重读可能把快照换走，
+        // 配置按键失效就写不出去了
+        if st.config_scheduled {
+            persist_config(ctx, &mut st).await;
+        }
         // 卸载前把在打的字写完：面已经不在了，待写值没机会再被投影出去
         report(ctx, settle(self.provider.get(), &mut st, false).await).await;
         // 写不出去的（多半是表格已先一步关闭）就地作废，不留到下一次挂载
@@ -322,10 +376,16 @@ impl PluginHandler for TableForm {
         }
         match note_table_change(&mut st, payload.path.as_deref()) {
             TableChange::Defer => return,
-            TableChange::Switched { dropped: true } => {
-                notify(ctx, DISCARDED_HINT, NotificationLevel::Warning).await;
+            TableChange::Switched { dropped } => {
+                // 换表 / 关表前把旧表的设置改动就地落盘：adopt 之后配置按键已指向别的表
+                if st.config_scheduled {
+                    persist_config(ctx, &mut st).await;
+                }
+                if dropped {
+                    notify(ctx, DISCARDED_HINT, NotificationLevel::Warning).await;
+                }
             }
-            TableChange::Switched { dropped: false } | TableChange::Reload => {}
+            TableChange::Reload => {}
         }
         report(ctx, settle(self.provider.get(), &mut st, true).await).await;
         render(ctx, &mut st, &self.tree).await;
@@ -422,30 +482,31 @@ impl PluginHandler for TableForm {
             Action::ToggleField { field } => match event_bool(&params.event) {
                 Some(show) => {
                     edit_config(&mut st, |cfg| cfg.toggle_hidden(&field, show));
-                    persist_config(ctx, &st).await;
+                    persist_config(ctx, &mut st).await;
                 }
                 None => eprintln!("忽略不带勾选状态的字段显隐事件：field = {field}"),
             },
             Action::ToggleRadio { field } => match event_bool(&params.event) {
                 Some(on) => {
                     edit_config(&mut st, |cfg| cfg.set_radio(&field, on));
-                    persist_config(ctx, &st).await;
+                    persist_config(ctx, &mut st).await;
                 }
                 None => eprintln!("忽略不带勾选状态的单选样式事件：field = {field}"),
             },
             Action::SetHelp { field } => match event_text(&params.event) {
                 Some(text) => {
                     edit_config(&mut st, |cfg| cfg.set_help(&field, &text));
-                    persist_config(ctx, &st).await;
+                    // 提示文字逐键上行：只改内存，停手后由防抖任务落盘，收尾点再强制补写
+                    let epoch = st.schedule_config_save();
+                    self.schedule_config_flush(ctx, epoch);
                 }
                 None => eprintln!("忽略不带文本的提示编辑事件：field = {field}"),
             },
             Action::MoveField { field, delta } => {
                 if let Some(snapshot) = st.snapshot.clone() {
-                    let key = snapshot.path.clone();
-                    st.config.table_mut(&key).move_field(&snapshot, &field, delta);
+                    edit_config(&mut st, |cfg| cfg.move_field(&snapshot, &field, delta));
                 }
-                persist_config(ctx, &st).await;
+                persist_config(ctx, &mut st).await;
             }
         }
         render(ctx, &mut st, &self.tree).await;
@@ -720,8 +781,9 @@ enum TableChange {
 }
 
 fn note_table_change(st: &mut AppState, path: Option<&str>) -> TableChange {
-    // 路径对不上就是换表 / 关表：按「宁可少写不可错写」放弃旧表的输入，不拿去赌新表里有同 id 的行
-    if path != st.table_key() {
+    // 事件路径与当前快照路径对不上就是换表 / 关表（配置分键用表 id，与这里的判定无关）：
+    // 按「宁可少写不可错写」放弃旧表的输入，不拿去赌新表里有同 id 的行
+    if path != st.snapshot.as_ref().map(|s| s.path.as_str()) {
         return TableChange::Switched { dropped: st.discard_pending() };
     }
     // 只有防抖任务还挂着才算「正在打字」：写失败留下的待值不该把重读一直挡住
@@ -786,7 +848,9 @@ async fn load_config(ctx: &Context) -> FormConfig {
     }
 }
 
-async fn persist_config(ctx: &Context, st: &AppState) {
+async fn persist_config(ctx: &Context, st: &mut AppState) {
+    // 就地写就不再等防抖任务：它醒来只会把同一份配置再写一遍
+    st.cancel_config_flush();
     if st.table_key().is_none() {
         return; // 没有打开表格就没有可配置的表，配置改动留在内存里等下一次落盘
     }
@@ -1204,6 +1268,31 @@ mod tests {
         assert_eq!(note_table_change(&mut st, Some("另一张.atb")), TableChange::Switched { dropped: true });
         assert!(st.pending.is_empty() && st.drafts.is_empty(), "旧表的待写不得活过换表");
         assert!(!st.flush_scheduled && !st.reload_requested, "作废后不再有在途收尾");
+    }
+
+    #[test]
+    fn config_is_keyed_by_table_id_when_present() {
+        // 有稳定 id 的表按 id 分键：改名 / 移动后配置仍跟得上
+        let mut snapshot = snapshot_with(&["r1"]);
+        snapshot.id = Some("t-9".into());
+        let mut st = state_from(snapshot);
+        assert_eq!(st.table_key(), Some("t-9"));
+        edit_config(&mut st, |cfg| cfg.toggle_hidden("f", false));
+        assert!(st.config.forms.contains_key("t-9"), "配置应落在 id 键下");
+        assert!(!st.config.forms.contains_key("任务.atb"), "不得再按路径分键");
+        // 宿主未给 id 的表退回路径
+        let st = state_with(&["r1"]);
+        assert_eq!(st.table_key(), Some("任务.atb"));
+    }
+
+    #[test]
+    fn config_save_epoch_pairs_schedule_and_cancel() {
+        let mut st = AppState::default();
+        let epoch = st.schedule_config_save();
+        assert!(st.config_scheduled, "登记后应有防抖任务在等");
+        st.cancel_config_flush();
+        assert!(!st.config_scheduled, "就地落盘后不再有在途任务");
+        assert_ne!(st.config_epoch, epoch, "作废要让旧任务醒来即退");
     }
 
     #[tokio::test]

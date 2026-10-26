@@ -201,20 +201,26 @@ fn image_cell(raw: Option<&Value>) -> CellValue {
         return CellValue::Images(ImageCell::default());
     };
     if let Some(list) = raw.as_array() {
-        return CellValue::Images(ImageCell { paths: string_list(list), extra: Map::new() });
+        return image_list(list, Map::new(), raw);
     }
     match raw.get("images").and_then(Value::as_array) {
         Some(list) => {
             let mut extra = raw.as_object().cloned().unwrap_or_default();
             extra.remove("images");
-            CellValue::Images(ImageCell { paths: string_list(list), extra })
+            image_list(list, extra, raw)
         }
         None => CellValue::Foreign(raw.clone()),
     }
 }
 
-fn string_list(list: &[Value]) -> Vec<String> {
-    list.iter().filter_map(Value::as_str).map(str::to_string).collect()
+/// 把图片引用数组解成 [`ImageCell`]；数组里混着非字符串条目时整格收
+/// [`CellValue::Foreign`]——只挑字符串解会把其余条目在写回时悄悄删掉。
+/// `extra` 是该格除路径外的原键（裸数组形态没有原键，传空表）。
+fn image_list(list: &[Value], extra: Map<String, Value>, raw: &Value) -> CellValue {
+    match list.iter().map(|v| v.as_str().map(str::to_string)).collect::<Option<Vec<String>>>() {
+        Some(paths) => CellValue::Images(ImageCell { paths, extra }),
+        None => CellValue::Foreign(raw.clone()),
+    }
 }
 
 /// 整数按整数存，与宿主数值口径一致（避免 `8` 与 `8.0` 反复判成改动）。
@@ -329,9 +335,9 @@ impl Row {
 /// 表格快照：一次读取到的字段结构与行数据，界面与写值都以它为投影真源。
 #[derive(Clone, Debug, Default)]
 pub struct TableSnapshot {
-    /// 表格文件的仓库相对路径，同时是表单配置的分键。
+    /// 表格文件的仓库相对路径；`table:changed` 按它判断是不是同一张表。
     pub path: String,
-    /// 表格稳定 id（宿主分配，改名 / 移动后不变）；图片附件目录按它落位。
+    /// 表格稳定 id（宿主分配，改名 / 移动后不变）；表单配置与图片附件目录都按它落位。
     pub id: Option<String>,
     pub fields: Vec<Field>,
     pub rows: Vec<Row>,
@@ -433,6 +439,17 @@ mod tests {
         let cell = CellValue::from_wire(&FieldType::Image, Some(&json!(["p.png"])));
         assert_eq!(cell.images(), ["p.png"]);
         assert_eq!(cell.to_wire(), Some(json!({"images": ["p.png"]})));
+    }
+
+    #[test]
+    fn image_list_with_non_string_entry_stays_unwritable() {
+        // 数组里混着非字符串条目：整格收只读。只挑字符串解会在写回时把那条内容悄悄删掉
+        let raw = json!({"images": ["a.png", 123], "display": "grid"});
+        let cell = CellValue::from_wire(&FieldType::Image, Some(&raw));
+        assert_eq!(cell, CellValue::Foreign(raw));
+        assert_eq!(cell.to_wire(), None);
+        let bare = CellValue::from_wire(&FieldType::Image, Some(&json!(["a.png", false])));
+        assert_eq!(bare, CellValue::Foreign(json!(["a.png", false])));
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! 表单配置：每个表格各自的字段取舍、顺序、提示与单选渲染样式。
 //!
 //! 本模块只做纯数据与派生逻辑（不碰宿主）；读写经 `state.read`/`state.write` 在入口处完成，
-//! 整份配置序列化为一个 JSON 存进插件自持数据，按表格的仓库相对路径分键，切表格即换一份配置。
+//! 整份配置序列化为一个 JSON 存进插件自持数据，按表格稳定 id 分键（宿主未给 id 的表退回
+//! 仓库相对路径），切表格即换一份配置。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -13,7 +14,7 @@ use crate::model::{Field, TableSnapshot};
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FormConfig {
-    /// key = 表格文件的仓库相对路径（宿主快照不给稳定表 id，路径是唯一可用的分键）。
+    /// key = 表格稳定 id（改名 / 移动后不变）；宿主未给 id 的表退回仓库相对路径。
     pub forms: BTreeMap<String, TableFormConfig>,
 }
 

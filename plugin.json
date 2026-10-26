@@ -1,7 +1,7 @@
 {
   "id": "com.atelyx.table-form",
   "name": "表格表单",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "apiVersion": 1,
   "entry": {
     "windows": "table-form.exe",
